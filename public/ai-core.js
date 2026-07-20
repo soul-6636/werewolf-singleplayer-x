@@ -319,6 +319,75 @@ export function validatePublicSpeech(text, players = [], maxChars = 180) {
   return { ok: true, text: normalized, changed: normalized !== raw };
 }
 
+function publicRoleRevelations(publicEvents = []) {
+  const roles = new Map();
+  for (const event of publicEvents || []) {
+    if (event?.kind !== "death") continue;
+    const match = String(event.text || "").match(/([1-6])\s*号[^。！？\n]{0,24}公开确认是(狼人|女巫|预言家|平民)/);
+    if (match) roles.set(Number(match[1]), match[2]);
+  }
+  return roles;
+}
+
+export function validatePublicSpeechEvidence(text, { speakerSeat = null, publicEvents = [], allowDeception = false } = {}) {
+  const normalized = String(text || "").trim();
+  const revealedRoles = publicRoleRevelations(publicEvents);
+  const seerClaim = /(?:我是|自称|跳)预言家/.test(normalized);
+  const roleFactPattern = /([1-6])\s*号?(?:玩家)?[^。！？\n]{0,12}?(?:已知|确认|坐实|确定|就是|是|为|属于|确实)\s*(狼人|女巫|预言家|平民|好人|狼)/g;
+  if (!allowDeception) {
+    for (const match of normalized.matchAll(roleFactPattern)) {
+      const seat = Number(match[1]);
+      const role = match[2];
+      if (revealedRoles.get(seat) === role || (role === "狼" && revealedRoles.get(seat) === "狼人")) continue;
+      if (Number(speakerSeat) === seat) continue;
+      if (seerClaim && ["狼人", "好人", "狼"].includes(role)) continue;
+      const nearby = normalized.slice(Math.max(0, match.index - 12), match.index + match[0].length + 4);
+      if (/(我怀疑|我认为|可能|大概率|更像|倾向|推测|假设|如果)/.test(nearby)) continue;
+      return { ok: false, reason: `公开记录没有确认${seat}号的真实身份，不能把“${seat}号是${role}”当成事实；请改成“我怀疑/我认为”或明确标注为身份声明` };
+    }
+    const identityTrust = normalized.match(/([1-6])\s*号?(?:玩家)?[^。！？\n]{0,8}(?:女巫|预言家|平民|狼人|好人)身份(?:可信|坐实|成立|确定|做实)/);
+    if (identityTrust && !revealedRoles.has(Number(identityTrust[1]))) {
+      return { ok: false, reason: `公开记录没有确认${identityTrust[1]}号的真实身份，不能把其自称的角色当成可信真值` };
+    }
+  }
+
+  const deathEvents = (publicEvents || [])
+    .filter((event) => event?.kind === "death")
+    .map((event) => String(event.text || ""));
+  const publicCause = deathEvents.some((event) => /(女巫.*毒|毒杀|毒死|被毒|狼刀|被刀|自刀|自爆)/.test(event));
+  if (!publicCause && !allowDeception) {
+    const causeSentences = normalized.split(/[。！？\n]/).filter((sentence) =>
+      /(女巫.*毒|毒杀|毒死|被毒|狼刀|被刀|刀了|狼人.*(?:刀|杀)|解药.*救|救了)/.test(sentence)
+      && !/(不能|无法|未知|不确定|未公布|没有公开|不知道|仅是猜测|如果)/.test(sentence)
+    );
+    if (causeSentences.length) return { ok: false, reason: "公开事件只公布了出局座位，没有公布狼刀、毒药或解药来源；不能断言具体死因" };
+    if (/感谢女巫/.test(normalized) && !/不能|无法|未知|不确定|未公布|没有公开/.test(normalized)) {
+      return { ok: false, reason: "公开事件没有确认女巫用药，不能感谢或默认女巫已经毒杀/救人" };
+    }
+  }
+  return { ok: true, text: normalized };
+}
+
+export function validateSeerSpeech(text, { speakerSeat = null, checks = [] } = {}) {
+  const expected = new Map((checks || []).map((check) => [Number(check.targetSeat), check.faction]));
+  const found = new Map();
+  const pattern = /([1-6])\s*号?\s*(?:是|为)?\s*(狼人|狼|好人|平民)/g;
+  for (const match of String(text || "").matchAll(pattern)) {
+    const seat = Number(match[1]);
+    const role = match[2];
+    const before = String(text || "").slice(Math.max(0, match.index - 4), match.index);
+    if (seat === Number(speakerSeat) && /我(?:是|作为)\s*$/.test(before)) continue;
+    const actualFaction = ["狼人", "狼"].includes(role) ? "werewolf" : "village";
+    if (!expected.has(seat)) return { ok: false, reason: `预言家不能把未查验的${seat}号说成${role}` };
+    if (expected.get(seat) !== actualFaction) return { ok: false, reason: `预言家公开的${seat}号查验结果与真实查验记录不一致` };
+    found.set(seat, actualFaction);
+  }
+  for (const seat of expected.keys()) {
+    if (!found.has(seat)) return { ok: false, reason: `预言家必须公开报告${seat}号的真实查验结果` };
+  }
+  return { ok: true, text: String(text || "").trim() };
+}
+
 export function validateGameState(state) {
   const errors = [];
   if (!state || !Array.isArray(state.players)) return ["游戏状态缺少玩家列表"];
@@ -497,7 +566,8 @@ export function validateReplayDocument(replay) {
   } else {
     let previousId = 0;
     const seenDeadSeats = new Set();
-    for (const event of replay.events) {
+    for (let eventIndex = 0; eventIndex < replay.events.length; eventIndex += 1) {
+      const event = replay.events[eventIndex];
       if (!Number.isInteger(event.id) || event.id <= previousId) errors.push("回放公开事件 sequence 不单调递增");
       previousId = Number(event.id) || previousId;
       if (event.kind === "death") {
@@ -506,6 +576,25 @@ export function validateReplayDocument(replay) {
       if (event.kind !== "speech") continue;
       const check = validatePublicSpeech(event.text, replay.players);
       if (!check.ok || check.changed) errors.push("回放公开发言包含非法信息");
+      const speakerSeat = Number(String(event.actor || "").match(/[1-6]/)?.[0] || 0);
+      const speaker = replay.players.find((player) => Number(player.seat) + 1 === speakerSeat);
+      const evidenceCheck = validatePublicSpeechEvidence(event.text, {
+        speakerSeat,
+        publicEvents: replay.events.slice(0, eventIndex),
+        allowDeception: speaker?.role === "werewolf"
+      });
+      if (!evidenceCheck.ok) errors.push(`回放${speakerSeat || "未知"}号发言越过公开事实边界：${evidenceCheck.reason}`);
+      if (speaker?.role === "seer") {
+        const claim = (replay.publicClaims || []).find((item) => item.playerId === speaker.id);
+        const seerCheck = validateSeerSpeech(event.text, {
+          speakerSeat,
+          checks: (claim?.checks || []).map((item) => ({
+            targetSeat: Number(replay.players.find((player) => player.id === item.targetId)?.seat) + 1,
+            faction: item.faction
+          }))
+        });
+        if (!seerCheck.ok) errors.push(`回放${speakerSeat}号预言家公开查验不一致：${seerCheck.reason}`);
+      }
     }
     for (const player of replay.players) {
       if (!player.alive && !seenDeadSeats.has(Number(player.seat) + 1)) errors.push(`回放缺少${Number(player.seat) + 1}号死亡事件`);

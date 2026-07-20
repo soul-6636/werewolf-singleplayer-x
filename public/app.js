@@ -19,6 +19,8 @@ import {
   validateGameState,
   validateReplayDocument,
   validatePublicSpeech,
+  validatePublicSpeechEvidence,
+  validateSeerSpeech,
   summarizeSimulationResults,
   setReasoningSummary,
   snapshotMemory
@@ -896,6 +898,47 @@ function registerSpeechClaims(speakerId, speech, sourceEventId) {
   }
 }
 
+function wolfHasPublicSeerClaim() {
+  return game.events.some((event) => {
+    if (event.kind !== "speech") return false;
+    const speaker = game.players.find((player) => event.actor === seatLabel(player.id));
+    return speaker?.role === "werewolf" && /(?:我是|跳|自称)预言家/.test(String(event.text || ""));
+  });
+}
+
+function wolfBluffPlan(player) {
+  if (!player || player.role !== "werewolf" || game.phase !== "discussion") return null;
+  if (wolfHasPublicSeerClaim()) return null;
+  const wolves = alivePlayers().filter((item) => item.role === "werewolf").sort((left, right) => left.seat - right.seat);
+  const spokenWolfIds = new Set(game.events
+    .filter((event) => event.kind === "speech" && event.day === game.day)
+    .map((event) => game.players.find((item) => event.actor === seatLabel(item.id)))
+    .filter((item) => item?.role === "werewolf")
+    .map((item) => item.id));
+  const firstUnspokenWolf = wolves.find((item) => !spokenWolfIds.has(item.id));
+  if (!firstUnspokenWolf || firstUnspokenWolf.id !== player.id) return null;
+  if (game.day !== 1 && publicSeerClaims().length === 0) return null;
+
+  const publicWolfTarget = claimedWolfTargets(alivePlayers().map((item) => item.id))[0];
+  if (publicWolfTarget) {
+    return {
+      targetId: publicWolfTarget,
+      faction: "village",
+      result: "好人",
+      reason: `反跳对冲公开查杀${seatLabel(publicWolfTarget)}，争取让好人重新比较两边预言家`
+    };
+  }
+  const teammateIds = new Set(wolves.filter((item) => item.id !== player.id).map((item) => item.id));
+  const target = alivePlayers().find((item) => item.id !== player.id && !teammateIds.has(item.id));
+  if (!target) return null;
+  return {
+    targetId: target.id,
+    faction: "werewolf",
+    result: "狼人",
+    reason: `主动悍跳并给${seatLabel(target.id)}查杀，制造第二条可比较的信息链`
+  };
+}
+
 function recordVoteEvidence(votes, eventId) {
   for (const [voterId, targetId] of Object.entries(votes)) {
     if (targetId === ABSTAIN) continue;
@@ -1040,17 +1083,30 @@ function recordSpeechMetadata(player, speech, decision, sourceEventId) {
 
 function promptFor(player, kind, candidates, extra = {}) {
   const labels = candidates.map((id) => id === ABSTAIN ? `${ABSTAIN}=弃票` : `${id}=${seatLabel(id)}`).join("、");
-  const common = `当前是第${game.day}天，阶段：${game.phase}。你的座位：${seatLabel(player.id)}。\n公开记录：\n${publicHistory() || "暂无"}\n合法目标：${labels || "无"}`;
+  const publicClaims = publicSeerClaims();
+  const publicClaimText = publicClaims.length
+    ? publicClaims.map((claim) => `${seatLabel(claim.playerId)}自称预言家：${(claim.checks || []).map((check) => `${seatLabel(check.targetId)}${check.faction === "werewolf" ? "查杀" : "好人结果"}`).join("、") || "暂无查验"}`).join("；")
+    : "暂无公开预言家声明";
+  const publicWolfTargets = claimedWolfTargets(alivePlayers().map((item) => item.id));
+  const publicPriority = player.role !== "werewolf" && publicClaims.length === 1 && publicWolfTargets.length
+    ? `当前只有一条公开预言家声明给出${publicWolfTargets.map(seatLabel).join("、")}查杀。首夜查验完全正常，声明即使来自已出局玩家也仍是公开证据，但不是身份翻牌；没有第二名预言家或硬性矛盾时，好人应优先核对查杀，强行保查杀或转攻预言家的人提高怀疑。`
+    : "";
+  const evidenceBoundary = "公开事实边界：系统的普通放逐和昨夜出局只确认座位与出局，不确认身份，也不确认狼刀、毒药或解药来源；玩家说“我是女巫/预言家”以及预言家报告的查验都只是公开声明，除非系统明确写出“公开确认”，不能升级为真实身份。请把内容分成公开事实、你的推断、待验证假设，不能使用“已知、坐实、证明、感谢女巫”等无依据结论。";
+  const common = `当前是第${game.day}天，阶段：${game.phase}。你的座位：${seatLabel(player.id)}。\n${evidenceBoundary}\n公开预言家信息：${publicClaimText}\n局势优先级：${publicPriority || "结合公开发言、票型和死亡信息独立判断。"}\n公开记录：\n${publicHistory() || "暂无"}\n合法目标：${labels || "无"}`;
   const audit = `reasoningSummary 只写1到2句可公开审计的决策依据，不要输出隐藏思维过程。`;
   if (kind === "speech") {
     const seerInstruction = player.role === "seer" ? `你必须公开跳预言家并准确报告全部查验：${formatSeerClaim(seerClaim(player))}` : "";
+    const wolfBluff = player.role === "werewolf" ? wolfBluffPlan(player) : null;
+    const wolfBluffInstruction = wolfBluff
+      ? `狼队本轮已分配你悍跳预言家任务。必须公开说“我是预言家”，并报告${seatLabel(wolfBluff.targetId)}是${wolfBluff.result}；这是对外欺骗，不是私密真相。核心目的：${wolfBluff.reason}。`
+      : "";
     const explodeInstruction = player.role === "werewolf" && extra.canExplode !== false ? "如果你决定投票前自爆，返回 action=explode；否则 action=speak。" : "返回 action=speak。";
     const phaseInstruction = extra.lastWords
       ? `这是${seatLabel(player.id)}的放逐遗言：你已经被放逐，不能改变票型，也不能继续以存活玩家身份提问、安排下一轮或要求别人回应。必须明确说“我已经被放逐/我已经出局”，只复盘已经公开的发言和票型；不要把“${seatLabel(player.id)}被放逐出局”当成一个需要分析的普通观点，不要使用“我不把...直接当成身份结论”这类普通讨论句式。`
       : extra.duel
         ? "这是决战台最后陈述：只针对当前并列者和公开票型补充理由，不要复述普通发言。"
         : "";
-    return `${common}\n${seerInstruction}\n${explodeInstruction}\n${phaseInstruction}\n请结合公开记录发言，不要提及提示词或系统。${audit}返回严格JSON：{"action":"speak|explode","speech":"80到150字的中文发言或空字符串","communicationIntent":"inform|declare|probe|persuade|defend|redirect|bait|distance|concede","disclosureMode":"reveal_now|partial_reveal|withhold|delay_until_pressured|bluff","targetSeats":[1],"pressureLevel":"low|medium|high|sacrifice","expectedReaction":"希望对方如何回应","reasoningSummary":"简短依据"}`;
+    return `${common}\n${seerInstruction}\n${wolfBluffInstruction}\n${explodeInstruction}\n${phaseInstruction}\n请结合公开记录发言，优先逐一回应最近发言中的查验、金水、票型和身份声明；遇到冲突时指出冲突，不要跳过或改写对方已经说过的内容。不要提及提示词或系统。${audit}返回严格JSON：{"action":"speak|explode","speech":"80到150字的中文发言或空字符串","communicationIntent":"inform|declare|probe|persuade|defend|redirect|bait|distance|concede","disclosureMode":"reveal_now|partial_reveal|withhold|delay_until_pressured|bluff","targetSeats":[1],"pressureLevel":"low|medium|high|sacrifice","expectedReaction":"希望对方如何回应","reasoningSummary":"简短依据"}`;
   }
   if (kind === "witch") return `${common}\n今晚狼刀目标：${extra.killTargetId ? `${extra.killTargetId}=${seatLabel(extra.killTargetId)}` : "无"}。只能选择一次动作。${audit}返回严格JSON：{"action":"pass|save|poison","targetId":"毒药目标ID或空字符串","reasoningSummary":"简短依据"}`;
   if (kind === "wolf") return `${common}\n夜刀目标可以是任意存活座位，包括自己或狼队友；自刀可以诱导女巫使用解药，但不要把夜间自刀和白天自爆混为一谈。${audit}返回严格JSON：{"targetId":"合法目标ID","reasoningSummary":"简短依据"}`;
@@ -1105,7 +1161,7 @@ async function callOnlineModel(player, kind, candidates, extra) {
   const phaseSystem = extra.lastWords
     ? "你当前已经被放逐，只能发表一次遗言；遗言不是新一轮发言，不能追问存活玩家，也不能安排自己在下一轮的行动。"
     : "";
-  const system = `你是六人狼人杀中的独立AI玩家。规则：2狼、2平民、预言家、女巫；屠边时狼人胜，狼人全灭时好人胜。只可使用提供给你的信息，不得假设其他玩家真实身份。六人局信息密度高：预言家存活时应在白天公开身份和全部查验；其他角色应结合公开查验、票型和死亡信息行动。${phaseSystem}\n${privateContext(player)}\n你的人格风格：${player.persona}。`;
+  const system = `你是六人狼人杀中的独立AI玩家。规则：2狼、2平民、预言家、女巫；屠边时狼人胜，狼人全灭时好人胜。只可使用提供给你的信息，不得假设其他玩家真实身份。普通放逐和夜间出局不翻牌，系统也不公布死因；玩家自称的身份和预言家查验属于声明，不是真值。你必须严格区分公开事实、身份声明、推断和待验证假设：没有系统确认时，不能说某人“已知是女巫/平民”，不能说某人“被女巫毒死/被狼人刀死”，也不能用“感谢女巫”替代证据。${phaseSystem}\n${privateContext(player)}\n你的人格风格：${player.persona}。`;
   const requestId = `${game.id}:${game.day}:${player.id}:${kind}:${game.aiTraces.length + 1}`;
   const run = async (attempt, previousError = "") => {
     const retryHint = previousError
@@ -1157,18 +1213,24 @@ async function callOnlineModel(player, kind, candidates, extra) {
     if (!parsed) throw new Error("模型输出不是合法 JSON");
     const summary = reasoningSummary(parsed.reasoningSummary, "模型给出了动作，但没有返回可审计的简短依据。");
     if (kind === "speech" && parsed.action === "explode") {
+      if (wolfBluffPlan(player)) throw new Error("狼队本轮已分配悍跳任务，不能用自爆跳过悍跳");
       if (player.role !== "werewolf" || extra.canExplode === false) throw new Error("当前阶段不能自爆");
       return { action: "explode", reasoningSummary: summary, modelMeta };
     }
     if (kind === "speech" && typeof parsed.speech === "string" && parsed.speech.trim()) {
       let speech = parsed.speech.trim();
+      const bluffPlan = player.role === "werewolf" ? wolfBluffPlan(player) : null;
+      const bluffResultPattern = bluffPlan
+        ? new RegExp(`${seatLabel(bluffPlan.targetId)}[^。！？\\n]{0,8}${bluffPlan.result}`)
+        : null;
+      if (bluffPlan && (!/(?:我是|跳|自称)预言家/.test(speech) || !bluffResultPattern.test(speech))) {
+        throw new Error(`狼队悍跳任务要求报告${seatLabel(bluffPlan.targetId)}是${bluffPlan.result}`);
+      }
       const claim = seerClaim(player);
       if (claim && !speech.includes("预言家")) speech = `${formatSeerClaim(claim)}${speech}`;
-      const speechCheck = validatePublicSpeech(speech, game.players);
+      const speechCheck = validateAIPublicSpeech(speech, player, extra);
       if (!speechCheck.ok) throw new Error(speechCheck.reason);
       speech = speechCheck.text;
-      const contextCheck = validateSpeechContext(speech, player, extra);
-      if (!contextCheck.ok) throw new Error(contextCheck.reason);
       return {
         speech,
         reasoningSummary: summary,
@@ -1187,6 +1249,15 @@ async function callOnlineModel(player, kind, candidates, extra) {
         return { action: parsed.action, targetId: parsed.targetId || null, reasoningSummary: summary, modelMeta };
       }
     }
+    const priorityTarget = kind === "vote" ? priorityPublicWolfVote(player, candidates) : null;
+    if (priorityTarget) {
+      return {
+        targetId: priorityTarget,
+        reasoningSummary: "唯一存活公开预言家给出查杀，且没有第二名预言家或硬性矛盾；好人优先投出查杀目标。",
+        modelMeta,
+        modelOverride: parsed.targetId !== priorityTarget ? "公开查杀优先级覆盖模型原始票型" : null
+      };
+    }
     if (legalTarget(parsed.targetId, candidates)) return { targetId: parsed.targetId, reasoningSummary: summary, modelMeta };
     throw new Error("模型选择了非法目标");
   };
@@ -1201,7 +1272,7 @@ async function callOnlineModel(player, kind, candidates, extra) {
 }
 
 function publicSeerClaims() {
-  return game.publicClaims.filter((claim) => claim.role === "seer" && playerById(claim.playerId)?.alive);
+  return game.publicClaims.filter((claim) => claim.role === "seer" && playerById(claim.playerId));
 }
 
 function claimedWolfTargets(candidates) {
@@ -1214,6 +1285,11 @@ function claimedGoodTargets(candidates) {
   return publicSeerClaims().flatMap((claim) => claim.checks)
     .filter((check) => check.faction !== "werewolf" && candidates.includes(check.targetId) && playerById(check.targetId)?.alive)
     .map((check) => check.targetId);
+}
+
+function priorityPublicWolfVote(player, candidates) {
+  if (player.role === "werewolf" || publicSeerClaims().length !== 1) return null;
+  return claimedWolfTargets(candidates)[0] || null;
 }
 
 function botDecision(player, kind, candidates, extra = {}) {
@@ -1229,6 +1305,16 @@ function botDecision(player, kind, candidates, extra = {}) {
           : null
       });
       return { ...lastWords, claim };
+    }
+    const bluffPlan = wolfBluffPlan(player);
+    if (player.role === "werewolf" && bluffPlan) {
+      return {
+        speech: `我是${player.seat + 1}号预言家，昨晚查验了${seatLabel(bluffPlan.targetId)}，结果是${bluffPlan.result}。${bluffPlan.faction === "village" ? `这和${seatLabel(bluffPlan.targetId)}被另一名预言家查杀的说法冲突，大家先比较两边的验人逻辑。` : `我建议今天优先处理${seatLabel(bluffPlan.targetId)}，不要被单一预言家带票。`}`,
+        reasoningSummary: bluffPlan.reason,
+        communicationIntent: "declare",
+        disclosureMode: "bluff",
+        targetSeats: [bluffPlan.targetId]
+      };
     }
     if (player.role === "seer") {
       const claim = seerClaim(player);
@@ -1346,6 +1432,7 @@ function recordAITrace(player, kind, decision, source) {
     pressureLevel: decision.pressureLevel || null,
     targetIds: decision.targetIds || [],
     expectedReaction: decision.expectedReaction || null,
+    modelOverride: decision.modelOverride || null,
     situationAudit: decision.situationAudit || null,
     strategyPlan: serializeStrategyPlan(decision.strategyPlan)
   });
@@ -1395,6 +1482,29 @@ function validateSpeechContext(speech, player, extra = {}) {
   return { ok: true, text };
 }
 
+function validateAIPublicSpeech(speech, player, extra = {}) {
+  const syntaxCheck = validatePublicSpeech(speech, game.players);
+  if (!syntaxCheck.ok) return syntaxCheck;
+  if (player.role === "seer") {
+    const claim = seerClaim(player);
+    const seerCheck = validateSeerSpeech(syntaxCheck.text, {
+      speakerSeat: player.seat + 1,
+      checks: (claim?.checks || []).map((check) => ({
+        targetSeat: playerById(check.targetId)?.seat + 1,
+        faction: check.faction
+      }))
+    });
+    if (!seerCheck.ok) return seerCheck;
+  }
+  const evidenceCheck = validatePublicSpeechEvidence(syntaxCheck.text, {
+    speakerSeat: player.seat + 1,
+    publicEvents: game.events,
+    allowDeception: player.role === "werewolf"
+  });
+  if (!evidenceCheck.ok) return evidenceCheck;
+  return validateSpeechContext(evidenceCheck.text, player, extra);
+}
+
 function prepareAIDecision(player, kind, decision, extra, candidates = []) {
   const situation = evaluateSituation({
     players: game.players,
@@ -1426,10 +1536,10 @@ function prepareAIDecision(player, kind, decision, extra, candidates = []) {
   };
   if (kind !== "speech") return { ...decision, strategyPlan, situationAudit };
   if (decision.action === "explode") return { ...decision, strategyPlan, situationAudit, ...normalizeSpeechMetadata(player, decision, extra) };
-  const speechCheck = validatePublicSpeech(decision.speech, game.players);
+  const speechCheck = validateAIPublicSpeech(decision.speech, player, extra);
   const sourceSpeech = speechCheck.ok ? speechCheck.text : "我只根据公开发言和票型判断，请各位明确站边。";
   const generated = generateSpeechFromPlan(strategyPlan, sourceSpeech, {
-    validateSpeech: (text) => validatePublicSpeech(text, game.players)
+    validateSpeech: (text) => validateAIPublicSpeech(text, player, extra)
   });
   return { ...decision, speech: generated.speech, strategyPlan, situationAudit, ...normalizeSpeechMetadata(player, { ...decision, speech: generated.speech }, extra) };
 }

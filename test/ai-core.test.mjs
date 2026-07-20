@@ -18,7 +18,9 @@ import {
   summarizeSimulationResults,
   validateReplayDocument,
   validateGameState,
-  validatePublicSpeech
+  validatePublicSpeech,
+  validatePublicSpeechEvidence,
+  validateSeerSpeech
 } from "../public/ai-core.js";
 
 const players = [
@@ -127,6 +129,32 @@ test("public speech rejects unsupported sensory claims and overlong output", () 
   assert.equal(validatePublicSpeech("我听到夜里有脚步声。", []).ok, false);
   assert.equal(validatePublicSpeech("x".repeat(181), []).ok, false);
   assert.equal(validatePublicSpeech("我只依据公开票型判断。", []).ok, true);
+});
+
+test("public speech evidence rejects invented roles and night causes", () => {
+  const events = [
+    { kind: "death", text: "4号被放逐出局。" },
+    { kind: "death", text: "昨夜 3号出局。" },
+    { kind: "speech", text: "2号自称女巫。" }
+  ];
+  assert.equal(validatePublicSpeechEvidence("4号出局是平民，已知2是女巫。", { speakerSeat: 1, publicEvents: events }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("昨晚3号大概率是女巫毒死的，感谢女巫。", { speakerSeat: 1, publicEvents: events }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("我怀疑4号是平民，但身份没有翻牌，不能确认。", { speakerSeat: 1, publicEvents: events }).ok, true);
+});
+
+test("public speech evidence accepts an explicit seer claim and public self-explosion", () => {
+  assert.equal(validatePublicSpeechEvidence("我是预言家，4号是狼人。", { speakerSeat: 3, publicEvents: [] }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("3号自爆，公开确认是狼人。", {
+    speakerSeat: 1,
+    publicEvents: [{ kind: "death", text: "3号自爆，公开确认是狼人。" }]
+  }).ok, true);
+});
+
+test("seer speech cannot invent an extra good result", () => {
+  const checks = [{ targetSeat: 4, faction: "werewolf" }];
+  assert.equal(validateSeerSpeech("我是3号预言家，4号是狼人。", { speakerSeat: 3, checks }).ok, true);
+  assert.equal(validateSeerSpeech("我是3号预言家，4号是狼人，1号是好人。", { speakerSeat: 3, checks }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("3号是狼人，狼刀3。", { speakerSeat: 6, publicEvents: [], allowDeception: true }).ok, true);
 });
 
 test("game-state invariants detect public leaks and invalid memory visibility", () => {
