@@ -46,6 +46,8 @@
               <option value="witch">固定：女巫</option>
               <option value="werewolf">固定：狼人</option>
             </select>
+            <label class="field-label" for="game-seed">复现种子 <small>可选</small></label>
+            <input id="game-seed" name="gameSeed" type="number" min="1" max="2147483646" inputmode="numeric" placeholder="留空则随机生成" />
             <label class="toggle-row" for="online-ai">
               <span><strong>启用线上 AI</strong><small>未配置时自动回退到 Bot</small></span>
               <input id="online-ai" type="checkbox" />
@@ -69,8 +71,12 @@
             </div>
             <div class="game-heading-meta">
               <div class="metric"><span>存活</span><strong id="alive-count">6/6</strong></div>
+              <div class="metric"><span>种子</span><strong id="game-seed-label">--</strong></div>
               <div class="metric"><span>规则</span><strong>屠边</strong></div>
               <button class="quiet-button developer-toggle" id="toggle-developer" type="button" aria-pressed="false">开发模式：关</button>
+              <button class="quiet-button" id="export-replay" type="button">导出回放</button>
+              <button class="quiet-button" id="import-replay" type="button">导入回放</button>
+              <input id="replay-file" type="file" accept="application/json,.json" hidden />
               <button class="quiet-button" id="new-game" type="button">新开一局</button>
             </div>
           </div>
@@ -110,7 +116,7 @@
           <section class="developer-panel panel hidden" id="developer-panel" aria-label="开发者信息">
             <div class="panel-header developer-header">
               <div><span class="section-label">DEVELOPER VIEW</span><h2>身份与决策审计</h2></div>
-              <span class="developer-warning">仅供调试，不属于玩家可见信息</span>
+              <div class="developer-tools"><button class="quiet-button" id="run-simulation" type="button">运行 100 局模拟</button><span class="simulation-status" id="simulation-status"></span><span class="simulation-metrics" id="simulation-metrics"></span><span class="developer-warning">仅供调试，不属于玩家可见信息</span></div>
             </div>
             <div class="developer-grid">
               <div>
@@ -121,6 +127,18 @@
                 <h3 class="developer-subtitle">AI 决策记录</h3>
                 <div class="debug-traces" id="debug-traces"></div>
               </div>
+            </div>
+            <div class="debug-wolf-room-wrap">
+              <h3 class="developer-subtitle">狼队私聊（开发审计）</h3>
+              <div class="debug-wolf-room" id="debug-wolf-room"></div>
+            </div>
+            <div class="debug-memory-wrap">
+              <h3 class="developer-subtitle">AI 独立认知快照（开发审计）</h3>
+              <div class="debug-memories" id="debug-memories"></div>
+            </div>
+            <div class="debug-invariant-wrap">
+              <h3 class="developer-subtitle">规则不变量</h3>
+              <div class="debug-invariants" id="debug-invariants"></div>
             </div>
           </section>
         </section>
@@ -146,9 +164,17 @@
         <input id="model-name" placeholder="deepseek-v4-flash" autocomplete="off" />
         <label class="field-label" for="api-key">API Key</label>
         <input id="api-key" type="password" placeholder="填入后才会发送到模型服务" autocomplete="off" />
+        <label class="field-label" for="reasoning-effort">思考强度</label>
+        <select id="reasoning-effort">
+          <option value="auto">自动（不额外指定）</option>
+          <option value="low">低（推荐）</option>
+          <option value="medium">中</option>
+          <option value="high">高</option>
+        </select>
         <label class="field-label" for="temperature">Temperature <output id="temperature-output">0.7</output></label>
         <input id="temperature" type="range" min="0" max="1.2" step="0.1" value="0.7" />
-        <div class="dialog-actions"><button class="quiet-button danger-button" id="clear-settings" type="button">清除本地配置</button><span class="dialog-spacer"></span><button class="quiet-button" value="cancel" type="submit">取消</button><button class="primary-button compact" id="save-settings" value="default" type="submit">保存到本地</button></div>
+        <p class="model-test-status" id="model-test-status" role="status" aria-live="polite"></p>
+        <div class="dialog-actions"><button class="quiet-button danger-button" id="clear-settings" type="button">清除本地配置</button><button class="quiet-button" id="test-model" type="button">测试连接</button><span class="dialog-spacer"></span><button class="quiet-button" value="cancel" type="submit">取消</button><button class="primary-button compact" id="save-settings" value="default" type="submit">保存到本地</button></div>
       </form>
     </dialog>
 

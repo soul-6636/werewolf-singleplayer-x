@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "gameId": "g_fixture",
+  "seed": 33,
+  "day": 2,
+  "phase": "ended",
+  "winner": "village",
+  "players": [
+    { "id": "P1", "seat": 0, "name": "甲甲", "role": "werewolf", "alive": false, "controller": "ai", "persona": "谨慎克制" },
+    { "id": "P2", "seat": 1, "name": "乙乙", "role": "werewolf", "alive": false, "controller": "ai", "persona": "逻辑直接" },
+    { "id": "P3", "seat": 2, "name": "你", "role": "villager", "alive": true, "controller": "human", "persona": "沉着" },
+    { "id": "P4", "seat": 3, "name": "丁丁", "role": "villager", "alive": true, "controller": "ai", "persona": "擅长观察" },
+    { "id": "P5", "seat": 4, "name": "戊戊", "role": "seer", "alive": true, "controller": "ai", "persona": "容易怀疑" },
+    { "id": "P6", "seat": 5, "name": "己己", "role": "witch", "alive": true, "controller": "ai", "persona": "温和但坚定" }
+  ],
+  "events": [
+    { "id": 1, "day": 1, "kind": "night", "actor": "系统", "text": "身份已经分配。第一夜开始，所有人闭眼。" },
+    { "id": 2, "day": 1, "kind": "death", "actor": "系统", "text": "昨夜 1 号出局。" },
+    { "id": 3, "day": 1, "kind": "speech", "actor": "3 号", "text": "我只根据公开票型判断，请各位明确站边。" },
+    { "id": 4, "day": 1, "kind": "death", "actor": "系统", "text": "1 号被放逐出局。" },
+    { "id": 5, "day": 1, "kind": "death", "actor": "系统", "text": "2 号被放逐出局。" },
+    { "id": 6, "day": 1, "kind": "death", "actor": "系统", "text": "所有狼人已经出局，好人阵营获胜。" }
+  ],
+  "aiTraces": [],
+  "privateEvents": [],
+  "publicClaims": [],
+  "claimGraph": { "version": 1, "nextId": 1, "nodes": [], "edges": [] },
+  "agentMemories": {},
+  "wolfRoom": { "messages": [], "proposals": [], "plan": null }
+}
