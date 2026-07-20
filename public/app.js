@@ -16,6 +16,7 @@ import {
   recordCommunication,
   recordDeception,
   reconcileMemoryDeceptions,
+  isExplicitSeerClaim,
   validateGameState,
   validateReplayDocument,
   validatePublicSpeech,
@@ -865,7 +866,8 @@ function registerSpeechClaims(speakerId, speech, sourceEventId) {
   const speaker = playerById(speakerId);
   if (!speaker || !speech) return;
   const nodes = [];
-  if (/(我是|跳|自称)预言家/.test(speech)) {
+  const claimsSeer = isSeerClaimText(speech);
+  if (claimsSeer) {
     nodes.push(addClaimNode(game.claimGraph, {
       day: game.day,
       speakerId,
@@ -885,7 +887,7 @@ function registerSpeechClaims(speakerId, speech, sourceEventId) {
       day: game.day,
       speakerId,
       speakerSeat: speaker.seat + 1,
-      type: CLAIM_TYPES.SEER_RESULT_CLAIM,
+      type: claimsSeer ? CLAIM_TYPES.SEER_RESULT_CLAIM : CLAIM_TYPES.IDENTITY_HYPOTHESIS,
       targetId: target.id,
       targetSeat: target.seat + 1,
       claimedValue: ["查杀", "狼人"].includes(match[2]) ? "werewolf" : "village",
@@ -898,11 +900,15 @@ function registerSpeechClaims(speakerId, speech, sourceEventId) {
   }
 }
 
+function isSeerClaimText(text) {
+  return isExplicitSeerClaim(text);
+}
+
 function wolfHasPublicSeerClaim() {
   return game.events.some((event) => {
     if (event.kind !== "speech") return false;
     const speaker = game.players.find((player) => event.actor === seatLabel(player.id));
-    return speaker?.role === "werewolf" && /(?:我是|跳|自称)预言家/.test(String(event.text || ""));
+    return speaker?.role === "werewolf" && isSeerClaimText(event.text);
   });
 }
 
@@ -994,7 +1000,7 @@ function seatIdFromSpeechValue(value) {
 
 function defaultCommunicationIntent(player, speech, action) {
   if (action === "explode") return "concede";
-  if (player.role === "seer" || /(我是|跳)预言家/.test(speech)) return "declare";
+  if (player.role === "seer" || isSeerClaimText(speech)) return "declare";
   if (/(怀疑|投|放逐|归票|优先处理)/.test(speech)) return "persuade";
   if (/(为什么|解释|验证|如果.*才)/.test(speech)) return "probe";
   if (/(质疑|反驳|不是我|别把)/.test(speech)) return "defend";
@@ -1020,7 +1026,7 @@ function normalizeSpeechMetadata(player, decision, extra = {}) {
     role: player.role,
     pressureLevel,
     hasUnreportedSeerResults: player.role === "seer" && Boolean(seerClaim(player)?.checks?.length),
-    claimsSeer: /(我是|跳)预言家/.test(speech)
+    claimsSeer: isSeerClaimText(speech)
   });
   const disclosureMode = DISCLOSURE_MODES.includes(decision.disclosureMode)
     ? decision.disclosureMode
@@ -1045,7 +1051,7 @@ function recordSpeechMetadata(player, speech, decision, sourceEventId) {
     role: player.role,
     pressureLevel: meta.pressureLevel,
     hasUnreportedSeerResults: player.role === "seer" && Boolean(seerClaim(player)?.checks?.length),
-    claimsSeer: /(我是|跳)预言家/.test(speech),
+    claimsSeer: isSeerClaimText(speech),
     forced: meta.disclosureMode
   });
   recordCommunication(memory, {
@@ -1058,7 +1064,7 @@ function recordSpeechMetadata(player, speech, decision, sourceEventId) {
     expectedReaction: meta.expectedReaction,
     text: speech
   });
-  if (player.role === "werewolf" && (meta.disclosureMode === "bluff" || /(我是|跳)预言家/.test(speech))) {
+  if (player.role === "werewolf" && (meta.disclosureMode === "bluff" || isSeerClaimText(speech))) {
     recordDeception(memory, {
       type: "BLUFF",
       day: game.day,
@@ -1074,7 +1080,7 @@ function recordSpeechMetadata(player, speech, decision, sourceEventId) {
     reconcileMemoryDeceptions(memory, {
       day: game.day,
       sourceEventId,
-      claimedRole: /(我是|跳)预言家/.test(speech) ? "seer" : null,
+      claimedRole: isSeerClaimText(speech) ? "seer" : null,
       claimedResults: []
     });
   }
@@ -1223,7 +1229,7 @@ async function callOnlineModel(player, kind, candidates, extra) {
       const bluffResultPattern = bluffPlan
         ? new RegExp(`${seatLabel(bluffPlan.targetId)}[^。！？\\n]{0,8}${bluffPlan.result}`)
         : null;
-      if (bluffPlan && (!/(?:我是|跳|自称)预言家/.test(speech) || !bluffResultPattern.test(speech))) {
+      if (bluffPlan && (!isSeerClaimText(speech) || !bluffResultPattern.test(speech))) {
         throw new Error(`狼队悍跳任务要求报告${seatLabel(bluffPlan.targetId)}是${bluffPlan.result}`);
       }
       const claim = seerClaim(player);

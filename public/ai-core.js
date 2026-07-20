@@ -329,10 +329,14 @@ function publicRoleRevelations(publicEvents = []) {
   return roles;
 }
 
+export function isExplicitSeerClaim(text) {
+  return /我\s*(?:是|就是|作为|自称(?:是|为)?|跳(?:了)?)\s*(?:[1-6]\s*号)?\s*预言家/.test(String(text || ""));
+}
+
 export function validatePublicSpeechEvidence(text, { speakerSeat = null, publicEvents = [], allowDeception = false } = {}) {
   const normalized = String(text || "").trim();
   const revealedRoles = publicRoleRevelations(publicEvents);
-  const seerClaim = /(?:我是|自称|跳)预言家/.test(normalized);
+  const seerClaim = isExplicitSeerClaim(normalized);
   const roleFactPattern = /([1-6])\s*号?(?:玩家)?[^。！？\n]{0,12}?(?:已知|确认|坐实|确定|就是|是|为|属于|确实)\s*(狼人|女巫|预言家|平民|好人|狼)/g;
   if (!allowDeception) {
     for (const match of normalized.matchAll(roleFactPattern)) {

@@ -11,6 +11,7 @@ import {
   createAgentMemory,
   createClaimGraph,
   expireSecondOrderBeliefs,
+  isExplicitSeerClaim,
   memoryPrompt,
   recordCommunication,
   refreshWolfCandidateSets,
@@ -88,6 +89,22 @@ test("claim evidence updates only the receiving agent memory", () => {
   assert.equal(memory.secondOrderBeliefs.length, 0);
 });
 
+test("ordinary identity opinions do not receive seer-result weight", () => {
+  const memory = createAgentMemory({ gameId: "g1", player: players[0], players });
+  addClaimToMemory(memory, {
+    id: "hypothesis_1",
+    speakerSeat: 2,
+    targetId: "P2",
+    targetSeat: 2,
+    type: CLAIM_TYPES.IDENTITY_HYPOTHESIS,
+    claimedValue: "werewolf",
+    sourceEventId: 6,
+    status: "ACTIVE"
+  });
+  assert.equal(memory.beliefs.P2.suspicion, 20);
+  assert.equal(memory.secondOrderBeliefs.length, 0);
+});
+
 test("wolf candidate sets never include the observing agent", () => {
   const memory = createAgentMemory({ gameId: "g1", player: players[0], players });
   addBeliefEvidence(memory, "P1", { delta: 25, eventId: 1, summary: "自我证据不应进入狼坑" });
@@ -144,10 +161,20 @@ test("public speech evidence rejects invented roles and night causes", () => {
 
 test("public speech evidence accepts an explicit seer claim and public self-explosion", () => {
   assert.equal(validatePublicSpeechEvidence("我是预言家，4号是狼人。", { speakerSeat: 3, publicEvents: [] }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("我是3号预言家，4号是狼人。", { speakerSeat: 3, publicEvents: [] }).ok, true);
   assert.equal(validatePublicSpeechEvidence("3号自爆，公开确认是狼人。", {
     speakerSeat: 1,
     publicEvents: [{ kind: "death", text: "3号自爆，公开确认是狼人。" }]
   }).ok, true);
+});
+
+test("third-person seer references do not become identity claims", () => {
+  assert.equal(isExplicitSeerClaim("5号跳预言家查3号金水"), false);
+  assert.equal(isExplicitSeerClaim("我认为5号是预言家"), false);
+  assert.equal(validatePublicSpeechEvidence("5号跳预言家查3号金水。3号是好人。", {
+    speakerSeat: 6,
+    publicEvents: []
+  }).ok, false);
 });
 
 test("seer speech cannot invent an extra good result", () => {
