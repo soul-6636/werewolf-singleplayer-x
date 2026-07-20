@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b1115" />
+    <title>Night Watch · 六人狼人杀</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Night Watch 首页">
+          <span class="brand-mark" aria-hidden="true">NW</span>
+          <span>
+            <strong>Night Watch</strong>
+            <small>六人单机狼人杀</small>
+          </span>
+        </a>
+        <div class="topbar-actions">
+          <span class="connection-pill"><span class="status-dot"></span><span id="connection-text">本地引擎就绪</span></span>
+          <button class="icon-button" id="open-settings" type="button" aria-label="打开模型设置" title="模型设置">☷</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="lobby" id="lobby-screen">
+          <div class="lobby-copy">
+            <p class="eyebrow">SINGLE PLAYER / 6 SEATS</p>
+            <h1>把每一句话，<br /><em>放到天亮以后。</em></h1>
+            <p class="lede">你与五名 AI 坐在同一张桌边。默认使用可复现的规则型 Bot；填入模型配置后，可切换线上 AI 发言与决策。</p>
+            <div class="rule-strip">
+              <span><b>2</b> 狼人</span><span><b>2</b> 平民</span><span><b>1</b> 预言家</span><span><b>1</b> 女巫</span>
+            </div>
+          </div>
+          <form class="start-card" id="start-form">
+            <div class="card-kicker">START A TABLE</div>
+            <h2>开一局</h2>
+            <label class="field-label" for="player-name">你的名字</label>
+            <input id="player-name" name="playerName" value="你" maxlength="12" autocomplete="off" />
+            <label class="field-label" for="role-mode">身份模式</label>
+            <select id="role-mode" name="roleMode">
+              <option value="random">随机身份（推荐）</option>
+              <option value="villager">固定：平民</option>
+              <option value="seer">固定：预言家</option>
+              <option value="witch">固定：女巫</option>
+              <option value="werewolf">固定：狼人</option>
+            </select>
+            <label class="toggle-row" for="online-ai">
+              <span><strong>启用线上 AI</strong><small>未配置时自动回退到 Bot</small></span>
+              <input id="online-ai" type="checkbox" />
+              <span class="toggle-ui" aria-hidden="true"></span>
+            </label>
+            <label class="toggle-row" for="developer-mode">
+              <span><strong>开发者模式</strong><small>公开身份与 AI 决策依据</small></span>
+              <input id="developer-mode" type="checkbox" />
+              <span class="toggle-ui" aria-hidden="true"></span>
+            </label>
+            <button class="primary-button" type="submit">进入夜晚 <span aria-hidden="true">→</span></button>
+            <p class="fine-print">屠边规则：平民边或神职边全部出局，狼人胜利；狼人全部死亡，好人胜利。</p>
+          </form>
+        </section>
+
+        <section class="game-screen hidden" id="game-screen">
+          <div class="game-heading">
+            <div>
+              <p class="eyebrow" id="phase-eyebrow">NIGHT 01</p>
+              <h1 id="phase-title">狼人行动</h1>
+            </div>
+            <div class="game-heading-meta">
+              <div class="metric"><span>存活</span><strong id="alive-count">6/6</strong></div>
+              <div class="metric"><span>规则</span><strong>屠边</strong></div>
+              <button class="quiet-button developer-toggle" id="toggle-developer" type="button" aria-pressed="false">开发模式：关</button>
+              <button class="quiet-button" id="new-game" type="button">新开一局</button>
+            </div>
+          </div>
+
+          <div class="game-grid">
+            <section class="table-panel panel">
+              <div class="panel-header">
+                <div><span class="section-label">THE TABLE</span><h2>座位</h2></div>
+                <span class="round-badge" id="round-badge">第 1 夜</span>
+              </div>
+              <div class="table-stage" id="table-stage">
+                <div class="table-core">
+                  <span class="moon-mark" aria-hidden="true">NW</span>
+                  <strong id="table-core-title">夜色正浓</strong>
+                  <small id="table-core-subtitle">等待行动</small>
+                </div>
+              </div>
+            </section>
+
+            <section class="timeline-panel panel">
+              <div class="panel-header">
+                <div><span class="section-label">PUBLIC LOG</span><h2>桌面记录</h2></div>
+                <span class="live-label"><span class="status-dot"></span> LIVE</span>
+              </div>
+              <div class="timeline" id="timeline" aria-live="polite"></div>
+            </section>
+
+            <aside class="action-panel panel">
+              <div class="panel-header">
+                <div><span class="section-label">YOUR HAND</span><h2>你的操作</h2></div>
+              </div>
+              <div id="role-card" class="role-card"></div>
+              <div id="action-content" class="action-content"></div>
+            </aside>
+          </div>
+
+          <section class="developer-panel panel hidden" id="developer-panel" aria-label="开发者信息">
+            <div class="panel-header developer-header">
+              <div><span class="section-label">DEVELOPER VIEW</span><h2>身份与决策审计</h2></div>
+              <span class="developer-warning">仅供调试，不属于玩家可见信息</span>
+            </div>
+            <div class="developer-grid">
+              <div>
+                <h3 class="developer-subtitle">完整身份</h3>
+                <div class="debug-roster" id="debug-roster"></div>
+              </div>
+              <div>
+                <h3 class="developer-subtitle">AI 决策记录</h3>
+                <div class="debug-traces" id="debug-traces"></div>
+              </div>
+            </div>
+          </section>
+        </section>
+      </main>
+
+      <footer class="footer"><span>规则引擎本地运行</span><span>·</span><span id="footer-ai">AI Bot 兜底模式</span></footer>
+    </div>
+
+    <dialog class="settings-dialog" id="settings-dialog">
+      <form method="dialog" class="settings-card" id="settings-form">
+        <div class="dialog-header"><div><p class="eyebrow">MODEL BRIDGE</p><h2>线上模型设置</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="关闭设置">×</button></div>
+        <p class="dialog-note">配置和 API Key 会以明文保存在当前浏览器本地，仅适合本机 Demo。未配置或调用失败时，AI 会使用本地 Bot 继续对局。</p>
+        <label class="field-label" for="api-dialect">协议</label>
+        <select id="api-dialect">
+          <option value="openai">OpenAI-compatible / Chat Completions</option>
+          <option value="anthropic">Anthropic-compatible / Messages</option>
+        </select>
+        <label class="field-label" for="base-url">Base URL</label>
+        <input id="base-url" placeholder="https://api.deepseek.com" autocomplete="off" />
+        <label class="field-label" for="endpoint-path">Endpoint Path</label>
+        <input id="endpoint-path" value="/chat/completions" autocomplete="off" />
+        <label class="field-label" for="model-name">Model</label>
+        <input id="model-name" placeholder="deepseek-v4-flash" autocomplete="off" />
+        <label class="field-label" for="api-key">API Key</label>
+        <input id="api-key" type="password" placeholder="填入后才会发送到模型服务" autocomplete="off" />
+        <label class="field-label" for="temperature">Temperature <output id="temperature-output">0.7</output></label>
+        <input id="temperature" type="range" min="0" max="1.2" step="0.1" value="0.7" />
+        <div class="dialog-actions"><button class="quiet-button danger-button" id="clear-settings" type="button">清除本地配置</button><span class="dialog-spacer"></span><button class="quiet-button" value="cancel" type="submit">取消</button><button class="primary-button compact" id="save-settings" value="default" type="submit">保存到本地</button></div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
