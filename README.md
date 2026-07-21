@@ -1,6 +1,6 @@
 # Night Watch：六人狼人杀 Demo
 
-这是一个无依赖的本地 Demo，默认使用确定性 Bot，不填写 Key 也可以完整测试对局。
+这是一个本地启动的 Demo，对局只使用线上 AI；需要先配置并测试模型连接。
 
 ## 启动
 
@@ -15,6 +15,15 @@ node server.mjs
 ```powershell
 npm run dev
 ```
+
+保持这个 PowerShell 窗口打开。服务端代理错误会打印在这里，包含时间、错误类型、请求 ID、协议、模型和堆栈；不会打印 API Key 或完整请求体。需要换端口时：
+
+```powershell
+$env:PORT=4174
+npm run dev
+```
+
+浏览器端状态机错误、非法目标原值和合法目标列表会在页面“开发者模式”中查看，也会脱敏转发到这个 PowerShell 窗口；不会转发 API Key、完整提示词或请求体。
 
 ## 规则
 
@@ -42,9 +51,11 @@ npm run dev
 - Model
 - API Key
 
-配置和 API Key 会以明文写入当前浏览器的 `localStorage`，刷新页面后自动回填，不写入项目文件。设置页可一键清除本地配置。该方式仅适合本机 Demo，不应在共享电脑或正式 Web 部署中使用。线上请求失败时会自动回退到 Bot。
+配置和 API Key 会以明文写入当前浏览器的 `localStorage`，刷新页面后自动回填，不写入项目文件。设置页可一键清除本地配置。该方式仅适合本机 Demo，不应在共享电脑或正式 Web 部署中使用。线上请求失败时对局会暂停，不会降级到其他决策方式。
 
-线上模型输出解析失败或动作校验失败时，客户端会带着校验错误重试一次，仍失败则回退到确定性 Bot。`deepseek-v4-flash` 会消耗输出预算进行推理，因此应用默认使用 `reasoning_effort=low`，并为发言和动作分别预留更大的 `max_tokens`，避免只返回 `reasoning_content` 而没有最终答案。设置页的“测试连接”会验证最终答案是否能经代理返回；对局页底部和开发者审计会显示实际调用、成功和回退数量。每名 AI 在单局内维护独立的公开事件、私密事件、声明、怀疑证据和轮次摘要；声明还会生成替代解释、动机受益关系和最多一层、按轮次过期的二阶假设。`AgentContext` 会按角色过滤私密频道：狼队只能读取 `wolf-room`，预言家只能读取 `seer-check`，女巫只能读取 `witch-night`，平民不读取这些频道。决策先由 `StrategyPlanner` 冻结合法动作和披露元数据，再由 `SpeechGenerator` 绑定公开文本；发言层不能改写目标、动作或读取真值。公开发言会记录内部沟通意图、披露模式、压力等级和预期反应；开发者模式可查看这些认知快照，普通视角不会显示。
+线上模型输出解析失败或动作校验失败时，客户端会带着校验错误重试一次，仍失败则暂停对局。`deepseek-v4-flash` 会消耗输出预算进行推理，因此应用默认使用 `reasoning_effort=low`，并为发言和动作分别预留更大的 `max_tokens`，避免只返回 `reasoning_content` 而没有最终答案。设置页的“测试连接”会验证最终答案是否能经代理返回；对局页底部和开发者审计会显示实际调用、成功、失败和重试数量。每名 AI 在单局内维护独立的公开事件、私密事件、声明、怀疑证据和轮次摘要；声明还会生成替代解释、动机受益关系和最多一层、按轮次过期的二阶假设。`AgentContext` 会按角色过滤私密频道：狼队只能读取 `wolf-room`，预言家只能读取 `seer-check`，女巫只能读取 `witch-night`，平民不读取这些频道。决策先由 `StrategyPlanner` 冻结合法动作和披露元数据，再由 `SpeechGenerator` 绑定公开文本；发言层不能改写目标、动作或读取真值。公开发言会记录内部沟通意图、披露模式、压力等级和预期反应；开发者模式可查看这些认知快照，普通视角不会显示。
+
+公开记录允许“大胆假设，小心求证”：AI 可以用“我怀疑、可能、大概率、推测、待验证”等标记提出狼刀或用药假设，但不能把未被引擎确认的死因写成事实。
 
 公开发言提交前会将玩家姓名和内部 `PlayerId` 规范化为座位号，并拒绝超长文本或未经引擎确认的脚步声、狗叫、呼吸声等感官信息；线上模型会在校验失败后重试一次。
 
@@ -53,11 +64,11 @@ npm run dev
 - 开局前可启用，也可以在对局中随时切换。
 - 桌面座位会显示全部真实身份。
 - 开发者面板会记录 AI 的发言、夜间技能、投票结果、来源和简短决策依据。
-- 开发者面板可以运行固定种子 Bot 模拟，并显示完成数、失败数、首个不变量错误、胜负分布、平均天数、AI 动作数和模型重试数；可通过 URL 参数 `simulationCount`、`simulationSeed` 缩小定点复现范围。
+- 开发者面板会记录线上 AI、状态机和规则不变量错误，包含阶段、座位、动作、消息和堆栈摘要；普通视角不显示这些诊断细节。
+- 开发者面板可以运行固定种子线上 AI 模拟，并显示完成数、失败数、首个不变量错误、胜负分布、平均天数、AI 动作数和模型重试数；可通过 URL 参数 `simulationCount`、`simulationSeed` 缩小定点复现范围。
 - 开发者面板会显示规则不变量检查结果，包括座位/角色数量、事件顺序、公开发言边界和 AgentMemory 私密频道权限。
 - 回放模式支持按公开事件上一步/下一步查看；导入文件会校验版本、角色数量、事件顺序和公开发言信息边界。
-- 决策依据是模型显式返回的 `reasoningSummary` 或 Bot 的策略说明，不是模型隐藏思维链。
-- 本地 Bot 的预言家会在白天公开身份和全部查验；好人会优先处理公开查杀，狼人会针对公开预言家调整行动。
+- 决策依据是模型显式返回的 `reasoningSummary`，不是模型隐藏思维链。
 
 OpenAI-compatible 默认路径：
 
@@ -78,13 +89,13 @@ Anthropic-compatible 默认路径：
 - `server/provider.mjs`：OpenAI-compatible / Anthropic-compatible 请求构造与响应归一化。
 - `public/ai-core.js`：AgentMemory 和 ClaimGraph 的纯数据层。
 - `public/ai-strategy.js`：策略计划冻结、发言绑定和策略审计快照。
-- `public/ai-speech.js`：基于公开事件、发言轮次和角色人格生成差异化 Bot 发言，并拦截重复表达。
+- `public/ai-speech.js`：保留发言校验与测试辅助能力，不作为对局运行时 AI。
 - `public/ai-situation.js`：基于合法后继状态的局势评估和终局分支模拟。
 - `public/ai-disclosure.js`：角色受权的披露模式规划，不保存私密事实值。
 - `public/ai-deception.js`：狼人欺骗账本、冲突检测、止损状态和不可变历史。
 - `server/jsonl.mjs`：稳定 StoredEvent 的 JSONL 追加与读取。
 - `test/fixtures/replay-sample.json`：回放导入的最小合法样例。
-- `public/app.js`：6 人屠边规则状态机、Bot 和 UI 交互。
+- `public/app.js`：6 人屠边规则状态机、线上 AI 调用和 UI 交互。
 - `public/index.html`：页面结构。
 - `public/styles.css`：响应式桌面/移动端样式。
 - `test/`：Provider contract test 和 AI 认知层单元测试。

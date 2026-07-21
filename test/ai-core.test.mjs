@@ -11,6 +11,7 @@ import {
   createAgentMemory,
   createClaimGraph,
   expireSecondOrderBeliefs,
+  extractPublicSeerClaim,
   isExplicitSeerClaim,
   memoryPrompt,
   recordCommunication,
@@ -21,7 +22,9 @@ import {
   validateGameState,
   validatePublicSpeech,
   validatePublicSpeechEvidence,
-  validateSeerSpeech
+  validateSeerSpeech,
+  validateSpeechTargets,
+  validateWitchSpeech
 } from "../public/ai-core.js";
 
 const players = [
@@ -87,6 +90,67 @@ test("claim evidence updates only the receiving agent memory", () => {
   assert.equal(memory.perspectiveAnalyses.length, 1);
   expireSecondOrderBeliefs(memory, 3);
   assert.equal(memory.secondOrderBeliefs.length, 0);
+});
+
+test("a false seer result against self becomes private hard evidence against its speaker", () => {
+  const roster = [
+    { id: "P1", seat: 0, role: "villager" },
+    { id: "P2", seat: 1, role: "werewolf" },
+    { id: "P3", seat: 2, role: "witch" }
+  ];
+  const witchMemory = createAgentMemory({ gameId: "g1", player: roster[2], players: roster });
+  const observerMemory = createAgentMemory({ gameId: "g1", player: roster[0], players: roster });
+  const claim = {
+    id: "claim_self_check",
+    day: 1,
+    speakerId: "P2",
+    speakerSeat: 2,
+    targetId: "P3",
+    targetSeat: 3,
+    type: CLAIM_TYPES.SEER_RESULT_CLAIM,
+    claimedValue: "werewolf",
+    sourceEventId: 5,
+    status: "ACTIVE"
+  };
+
+  addClaimToMemory(witchMemory, claim);
+  addClaimToMemory(observerMemory, claim);
+
+  assert.equal(witchMemory.claims[0].status, "CONTRADICTED_BY_SELF_KNOWLEDGE");
+  assert.equal(witchMemory.selfKnowledgeConflicts.length, 1);
+  assert.equal(witchMemory.beliefs.P2.suspicion >= 75, true);
+  assert.equal(witchMemory.wolfCandidateSets[0][0], "P2");
+  assert.match(memoryPrompt(witchMemory, (id) => `${roster.find((player) => player.id === id).seat + 1}号`), /自身真值反证.*2号.*不可能是真预言家/);
+
+  assert.equal(observerMemory.claims[0].status, "ACTIVE");
+  assert.equal(observerMemory.selfKnowledgeConflicts.length, 0);
+  assert.equal(observerMemory.beliefs.P2.suspicion, 20);
+  assert.doesNotMatch(memoryPrompt(observerMemory, (id) => id), /自身真值反证：.*不可能是真预言家/);
+});
+
+test("a correct result about self supports only the claim content, not the seer identity", () => {
+  const roster = [
+    { id: "P1", seat: 0, role: "werewolf" },
+    { id: "P2", seat: 1, role: "witch" }
+  ];
+  const memory = createAgentMemory({ gameId: "g1", player: roster[1], players: roster });
+  addClaimToMemory(memory, {
+    id: "claim_self_good",
+    day: 1,
+    speakerId: "P1",
+    speakerSeat: 1,
+    targetId: "P2",
+    targetSeat: 2,
+    type: CLAIM_TYPES.SEER_RESULT_CLAIM,
+    claimedValue: "village",
+    sourceEventId: 6,
+    status: "ACTIVE"
+  });
+
+  assert.equal(memory.claims[0].status, "SUPPORTED_BY_SELF_KNOWLEDGE");
+  assert.equal(memory.selfKnowledgeConflicts.length, 0);
+  assert.equal(memory.beliefs.P1.suspicion, 20);
+  assert.match(memoryPrompt(memory, (id) => `${roster.find((player) => player.id === id).seat + 1}号`), /自身真值印证.*不能证明.*真预言家/);
 });
 
 test("ordinary identity opinions do not receive seer-result weight", () => {
@@ -155,8 +219,105 @@ test("public speech evidence rejects invented roles and night causes", () => {
     { kind: "speech", text: "2号自称女巫。" }
   ];
   assert.equal(validatePublicSpeechEvidence("4号出局是平民，已知2是女巫。", { speakerSeat: 1, publicEvents: events }).ok, false);
-  assert.equal(validatePublicSpeechEvidence("昨晚3号大概率是女巫毒死的，感谢女巫。", { speakerSeat: 1, publicEvents: events }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("昨晚3号是女巫毒死的，感谢女巫。", { speakerSeat: 1, publicEvents: events }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("我怀疑昨晚3号可能是女巫毒死的，但公开没有确认，先结合票型验证。", { speakerSeat: 1, publicEvents: events }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("昨晚刀口是3号。", { speakerSeat: 5, publicEvents: events, allowDeception: true }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("我们狼队昨夜选择了3号。", { speakerSeat: 5, publicEvents: events, allowDeception: true }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("3号昨晚吃刀出局。", { speakerSeat: 5, publicEvents: events, allowDeception: true }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("3号倒在狼人的袭击下。", { speakerSeat: 5, publicEvents: events, allowDeception: true }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("我怀疑昨晚刀口可能是3号，仍然待验证。", { speakerSeat: 1, publicEvents: events }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("我怀疑可能是毒，实际狼刀3号。", { speakerSeat: 5, publicEvents: events, allowDeception: true }).ok, false);
   assert.equal(validatePublicSpeechEvidence("我怀疑4号是平民，但身份没有翻牌，不能确认。", { speakerSeat: 1, publicEvents: events }).ok, true);
+});
+
+test("role-aware evidence validation separates authorized claims from fabricated roles", () => {
+  assert.equal(validatePublicSpeechEvidence("我是预言家，4号是狼人。", {
+    speakerSeat: 3,
+    speakerRole: "villager",
+    publicEvents: []
+  }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("我是女巫，昨晚狼刀3号，我用解药救了3号。", {
+    speakerSeat: 6,
+    speakerRole: "witch",
+    publicEvents: []
+  }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("我是女巫，昨晚狼刀3号。", {
+    speakerSeat: 2,
+    speakerRole: "villager",
+    publicEvents: []
+  }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("我是预言家，4号是狼人。", {
+    speakerSeat: 5,
+    speakerRole: "werewolf",
+    publicEvents: [],
+    allowDeception: true
+  }).ok, true);
+});
+
+test("night-cause validation allows attributed challenges without accepting direct assertions", () => {
+  const challengedSpeech = "我是预言家，昨晚查验4号是好人。1号自称预言家查杀我，但他的发言暴露了上帝视角——如何知道5号被毒、6号被刀？狼人才可能知道死因细节。4号已经认我金水并指出1号漏洞，请3号看清局势：1号悍跳狼，我才是真预言家。今天放逐1号，好人稳赢。";
+  assert.equal(validatePublicSpeechEvidence(challengedSpeech, {
+    speakerSeat: 2,
+    speakerRole: "seer",
+    publicEvents: []
+  }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("1号声称5号被毒、6号被刀，我不认可这个说法。", {
+    speakerSeat: 2,
+    speakerRole: "seer",
+    publicEvents: []
+  }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("5号被毒、6号被刀，这一点已经确定。", {
+    speakerSeat: 2,
+    speakerRole: "seer",
+    publicEvents: []
+  }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("1号说5号被毒、6号被刀，我认为他说得对。", {
+    speakerSeat: 2,
+    speakerRole: "seer",
+    publicEvents: []
+  }).ok, false);
+});
+
+test("night-cause validation does not read negated certainty as confirmation", () => {
+  const speech = "2号声称女巫，刀口1号，毒4号，但系统未确认刀毒来源。我推测1号可能是狼刀目标，4号被毒但身份未知。作为平民，我们尚无有效查验，建议不要轻信任何身份声明。今天放逐应优先从2、5、6中找出矛盾点，尤其观察谁急于带节奏或跟风。另外，如果2号是真女巫，狼人今晚可能会刀他，他应提前安排救药或留逻辑。我暂持观望，需要更多发言验证。";
+  assert.equal(validatePublicSpeechEvidence(speech, {
+    speakerSeat: 3,
+    speakerRole: "villager",
+    publicEvents: []
+  }).ok, true);
+  for (const cautiousSpeech of [
+    "系统尚未确认5号被毒、6号被刀。",
+    "目前未确定5号被毒、6号被刀。",
+    "公开信息从未证明5号被毒、6号被刀。"
+  ]) {
+    assert.equal(validatePublicSpeechEvidence(cautiousSpeech, {
+      speakerSeat: 3,
+      speakerRole: "villager",
+      publicEvents: []
+    }).ok, true);
+  }
+  assert.equal(validatePublicSpeechEvidence("系统已经确认5号被毒、6号被刀。", {
+    speakerSeat: 3,
+    speakerRole: "villager",
+    publicEvents: []
+  }).ok, false);
+});
+
+test("extracts both true and bluff seer declarations as public claims", () => {
+  const bluff = extractPublicSeerClaim("我是5号预言家，昨晚查验3号，他是好人。", { speakerId: "P5", speakerSeat: 5, day: 1 });
+  assert.equal(bluff.playerId, "P5");
+  assert.deepEqual(bluff.checks, [{ targetSeat: 3, faction: "village" }]);
+  const direct = extractPublicSeerClaim("我是预言家，2号是狼人。", { speakerId: "P4", speakerSeat: 4, day: 1 });
+  assert.deepEqual(direct.checks, [{ targetSeat: 2, faction: "werewolf" }]);
+  const attributed = extractPublicSeerClaim("我是5号预言家，1号说2号是狼人，昨晚验3号是好人。", { speakerId: "P5", speakerSeat: 5, day: 1 });
+  assert.deepEqual(attributed.checks, [{ targetSeat: 3, faction: "village" }]);
+  assert.equal(extractPublicSeerClaim("我认为5号是预言家，2号可能是狼人。", { speakerId: "P1", speakerSeat: 1, day: 1 }), null);
+});
+
+test("a seer transcript keeps the speaker's own check separate from quoted claims and table talk", () => {
+  const speech = "我是预言家，昨晚查验3号是好人。2号自称预言家查杀1号，但未对跳时声明需审慎。1号首位发言无实质反驳，但也不能仅凭查杀认定狼人。";
+  const claim = extractPublicSeerClaim(speech, { speakerId: "P5", speakerSeat: 6, day: 1 });
+  assert.deepEqual(claim.checks, [{ targetSeat: 3, faction: "village" }]);
 });
 
 test("public speech evidence accepts an explicit seer claim and public self-explosion", () => {
@@ -181,7 +342,75 @@ test("seer speech cannot invent an extra good result", () => {
   const checks = [{ targetSeat: 4, faction: "werewolf" }];
   assert.equal(validateSeerSpeech("我是3号预言家，4号是狼人。", { speakerSeat: 3, checks }).ok, true);
   assert.equal(validateSeerSpeech("我是3号预言家，4号是狼人，1号是好人。", { speakerSeat: 3, checks }).ok, false);
-  assert.equal(validatePublicSpeechEvidence("3号是狼人，狼刀3。", { speakerSeat: 6, publicEvents: [], allowDeception: true }).ok, true);
+  assert.equal(validateSeerSpeech("我是6号预言家，昨晚查验了3号，他是好人。", { speakerSeat: 6, checks: [{ targetSeat: 3, faction: "village" }] }).ok, true);
+  assert.equal(validateSeerSpeech("我是6号预言家，昨晚查验3号，结果为好人。", { speakerSeat: 6, checks: [{ targetSeat: 3, faction: "village" }] }).ok, true);
+  assert.equal(validateSeerSpeech("我是6号预言家，3号不是狼人，是好人。", { speakerSeat: 6, checks: [{ targetSeat: 3, faction: "village" }] }).ok, true);
+  assert.equal(validateSeerSpeech("我是6号预言家，我认为2号大概率是狼人；昨晚查验3号，结果是好人。", { speakerSeat: 6, checks: [{ targetSeat: 3, faction: "village" }] }).ok, true);
+  assert.equal(validateSeerSpeech("我是6号预言家，1号说2号是狼人。昨晚查验3号，结果是好人。", { speakerSeat: 6, checks: [{ targetSeat: 3, faction: "village" }] }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("3号是狼人。", { speakerSeat: 6, publicEvents: [], allowDeception: true }).ok, true);
+  assert.equal(validatePublicSpeechEvidence("3号是狼人，昨晚我们狼刀3号。", { speakerSeat: 6, publicEvents: [], allowDeception: true }).ok, false);
+  assert.equal(validatePublicSpeechEvidence("我怀疑昨晚可能是狼刀3号，仍然待验证。", { speakerSeat: 6, publicEvents: [], allowDeception: true }).ok, true);
+});
+
+test("seer may withhold or partially reveal but cannot alter a revealed result", () => {
+  const checks = [
+    { targetSeat: 2, faction: "werewolf" },
+    { targetSeat: 4, faction: "village" }
+  ];
+  assert.equal(validateSeerSpeech("我先听完这一轮发言再决定是否公开身份。", {
+    speakerSeat: 6,
+    checks,
+    requireAll: false
+  }).ok, true);
+  assert.equal(validateSeerSpeech("我是预言家，2号是狼人。", {
+    speakerSeat: 6,
+    checks,
+    requireAll: false
+  }).ok, true);
+  assert.equal(validateSeerSpeech("我是预言家，2号是好人。", {
+    speakerSeat: 6,
+    checks,
+    requireAll: false
+  }).ok, false);
+  assert.equal(validateSeerSpeech("昨晚查验2号是狼人。", {
+    speakerSeat: 6,
+    checks,
+    requireAll: false
+  }).ok, false);
+});
+
+test("seer validation allows attributed checks and uncertain table reads alongside a real check", () => {
+  const speech = "我是预言家，昨晚查验2号是好人。3号自称预言家查杀1号，但1号跳女巫救了我。目前有两个预言家对跳，我建议先听1号女巫进一步解释为何救我，以及3号对跳的查验逻辑。今天放逐1号或3号，我倾向先放逐3号，因为我的查验信息是2号好人，而3号查杀1号可能为狼人身份。";
+  assert.equal(validateSeerSpeech(speech, {
+    speakerSeat: 4,
+    checks: [{ targetSeat: 2, faction: "village" }],
+    requireAll: false
+  }).ok, true);
+});
+
+test("witch may reveal only night facts that match her own action record", () => {
+  const facts = { killTargetSeat: 3, action: "save", poisonTargetSeat: null };
+  assert.equal(validateWitchSpeech("我是女巫，昨晚刀口是3号，我用了解药。", facts).ok, true);
+  assert.equal(validateWitchSpeech("我是女巫，昨晚刀口是4号，我用了解药。", facts).ok, false);
+  assert.equal(validateWitchSpeech("我是女巫，昨晚刀口是3号，但我没有用药。", facts).ok, false);
+  assert.equal(validateWitchSpeech("我是女巫，昨晚我毒了2号。", facts).ok, false);
+  assert.equal(validateWitchSpeech("我只根据公开票型判断。", facts).ok, true);
+});
+
+test("a public self-explosion does not reveal unrelated night causes", () => {
+  const events = [
+    { kind: "death", text: "3号自爆，公开确认是狼人。" },
+    { kind: "death", text: "昨夜4号出局。" }
+  ];
+  assert.equal(validatePublicSpeechEvidence("昨晚4号被狼刀了。", { speakerSeat: 1, publicEvents: events }).ok, false);
+});
+
+test("living players cannot request new responses from eliminated seats", () => {
+  const state = { aliveSeats: [1, 2, 3, 5] };
+  assert.equal(validateSpeechTargets("请6号补充今天的怀疑对象和归票理由。", state).ok, false);
+  assert.equal(validateSpeechTargets("6号请你回应一下昨天的票型。", state).ok, false);
+  assert.equal(validateSpeechTargets("回看6号昨天的解释，我认为2号应该回应。", state).ok, true);
+  assert.equal(validateSpeechTargets("请2号解释今天为什么改票。", state).ok, true);
 });
 
 test("game-state invariants detect public leaks and invalid memory visibility", () => {

@@ -219,6 +219,14 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .debug-memory-beliefs { margin-top: 9px; color: var(--blue); font-size: 11px; }
 .debug-memory-analysis { margin-top: 6px; color: var(--gold-soft); font-size: 10px; }
 .debug-memory-reason { margin-top: 6px; color: var(--subtle); font-size: 11px; line-height: 1.45; }
+.debug-error-wrap { margin-top: 26px; }
+.debug-errors { display: grid; gap: 9px; }
+.debug-error { padding: 11px 12px; border-left: 2px solid var(--red); background: rgba(233, 118, 101, .06); color: var(--muted); font-size: 11px; line-height: 1.45; }
+.debug-error-meta { color: var(--gold-soft); font-size: 10px; }
+.debug-error-message { margin-top: 5px; color: var(--ink); overflow-wrap: anywhere; }
+.debug-error-diagnostic { margin-top: 5px; color: var(--gold-soft); overflow-wrap: anywhere; }
+.debug-error-stack { margin: 7px 0 0; color: var(--subtle); font: 10px/1.45 Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.debug-error-inline { margin-top: 14px; padding: 10px 12px; border-left: 2px solid var(--red); background: rgba(233, 118, 101, .06); color: var(--muted); font-size: 10px; line-height: 1.45; }
 .debug-invariant-wrap { margin-top: 26px; }
 .debug-invariants { border-top: 1px solid var(--line); }
 .debug-invariant { padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 11px; line-height: 1.45; }

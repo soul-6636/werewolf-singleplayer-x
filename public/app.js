@@ -1,7 +1,6 @@
 import {
   CLAIM_TYPES,
   COMMUNICATION_INTENTS,
-  DISCLOSURE_MODES,
   PRESSURE_LEVELS,
   addBeliefEvidence,
   addClaimNode,
@@ -12,16 +11,21 @@ import {
   createAgentMemory,
   createClaimGraph,
   expireSecondOrderBeliefs,
+  extractPublicSeerClaim,
   memoryPrompt,
   recordCommunication,
   recordDeception,
   reconcileMemoryDeceptions,
   isExplicitSeerClaim,
+  isExplicitWitchClaim,
+  sanitizePublicSpeech,
   validateGameState,
   validateReplayDocument,
   validatePublicSpeech,
   validatePublicSpeechEvidence,
   validateSeerSpeech,
+  validateSpeechTargets,
+  validateWitchSpeech,
   summarizeSimulationResults,
   setReasoningSummary,
   snapshotMemory
@@ -29,7 +33,20 @@ import {
 import { generateSpeechFromPlan, planStrategy, serializeStrategyPlan } from "./ai-strategy.js";
 import { evaluateSituation } from "./ai-situation.js";
 import { planDisclosure } from "./ai-disclosure.js";
-import { generateContextualBotSpeech, generateLastWordsSpeech, speechFingerprint } from "./ai-speech.js";
+import { canExposeActiveActor, publicWaitingText, visiblePhaseForPlayer } from "./view-visibility.js";
+import { normalizeModelTarget, targetDiagnostic } from "./action-target.js";
+import { matchesWolfBluffReport } from "./wolf-bluff.js";
+import { validateWitchActionResources } from "./witch-action.js";
+import { createGameId } from "./game-id.js";
+import { buildDecisionPrompt, isDisclosureModeAllowed } from "./ai-prompt.js";
+import { createGameRunCoordinator, isStaleGameRunError, StaleGameRunError } from "./game-run.js";
+import {
+  SPEECH_ACT_TYPES,
+  claimsFromSpeechActs,
+  normalizeSpeechActs,
+  resolveSpeechDelivery,
+  validateSpeechActs
+} from "./speech-acts.js";
 
 const ROLES = {
   werewolf: { name: "狼人", faction: "werewolf", side: "wolf", description: "夜晚与队友选择一名目标；白天隐藏身份。" },
@@ -39,9 +56,9 @@ const ROLES = {
 };
 
 const PHASES = {
-  night_wolf: ["NIGHT", "狼人行动", "夜色正浓", "狼队正在选择目标"],
-  night_witch: ["NIGHT", "女巫行动", "药瓶轻响", "等待女巫作出选择"],
-  night_seer: ["NIGHT", "预言家查验", "微光浮现", "预言家正在查验"],
+  night_wolf: ["NIGHT", "夜间行动", "夜色正浓", "所有人闭眼，等待夜间行动"],
+  night_witch: ["NIGHT", "夜间行动", "夜色正浓", "所有人闭眼，等待夜间行动"],
+  night_seer: ["NIGHT", "夜间行动", "夜色正浓", "所有人闭眼，等待夜间行动"],
   night_resolve: ["NIGHT", "夜晚结算", "无人知晓", "命运正在落定"],
   dawn: ["DAWN", "天亮了", "晨钟响起", "公布昨夜结果"],
   discussion: ["DAY", "白天发言", "所有人睁眼", "依次陈述与判断"],
@@ -87,6 +104,22 @@ let modelStatus = "本地引擎就绪";
 let simulationMode = false;
 let simulationRunning = false;
 let lastInvariantSignature = "";
+const gameRuns = createGameRunCoordinator();
+let activeGameRun = null;
+
+function captureGameOperation() {
+  gameRuns.assertCurrent(activeGameRun);
+  if (!game || game.id !== activeGameRun.gameId) throw new StaleGameRunError(activeGameRun?.gameId || null);
+  return { run: activeGameRun, game };
+}
+
+function assertGameOperation(operation) {
+  gameRuns.assertCurrent(operation?.run);
+  if (!operation?.game || game !== operation.game || game.id !== operation.run.gameId) {
+    throw new StaleGameRunError(operation?.run?.gameId || null);
+  }
+  return operation.game;
+}
 
 function loadStoredObject(key) {
   try {
@@ -182,6 +215,40 @@ function addPrivateMemoryEvent(playerId, text, kind = "private") {
   if (playerId === humanPlayer()?.id) game.privateEvents.push({ day: game.day, text });
 }
 
+function recordErrorLog({ source = "runtime", error, playerId = null, kind = null, diagnostic = "" } = {}) {
+  if (!game) return;
+  const message = String(error?.message || error || "未知错误").trim().slice(0, 500);
+  const stack = String(error?.stack || "").trim().slice(0, 1200);
+  const safeDiagnostic = String(diagnostic || error?.diagnostic || "").trim().slice(0, 500);
+  const at = new Date().toISOString();
+  game.errorLog ||= [];
+  game.errorLog.push({
+    id: game.nextErrorId++,
+    at,
+    day: game.day,
+    phase: game.phase,
+    source,
+    playerId,
+    kind,
+    message,
+    diagnostic: safeDiagnostic,
+    stack
+  });
+  if (game.errorLog.length > 50) game.errorLog.shift();
+  if (!simulationMode) {
+    void fetch("/api/client-errors", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ at, day: game.day, phase: game.phase, source, playerId, kind, message, diagnostic: safeDiagnostic, stack })
+    }).then(async (response) => {
+      if (response.ok) return;
+      let payload = {};
+      try { payload = await response.json(); } catch {}
+      throw new Error(payload.error || `公开事件写入失败（${response.status}）`);
+    }).catch((error) => recordErrorLog({ source: "event-store", error }));
+  }
+}
+
 function addWolfMemoryEvent(text, speakerId = null) {
   for (const player of game.players.filter((item) => item.alive && item.role === "werewolf")) {
     addPrivateMemoryEvent(player.id, text, "wolf-room");
@@ -232,7 +299,7 @@ function createGame(playerName, roleMode, onlineAI, developerMode, seedOverride 
     persona: PERSONAS[Math.max(0, index - 1)] || "沉着"
   }));
   const seatedPlayers = shuffle(roster, random).map((player, seat) => ({ ...player, seat }));
-  const gameId = `g_${seed}`;
+  const gameId = createGameId(seed);
   return {
     id: gameId,
     seed,
@@ -263,51 +330,65 @@ function createGame(playerName, roleMode, onlineAI, developerMode, seedOverride 
     nextEventId: 1,
     nextPrivateEventId: 1,
     nextTraceId: 1,
+    nextErrorId: 1,
+    errorLog: [],
     onlineAI,
     debugMode: developerMode,
     revealedRoles: [],
     ended: false,
+    error: null,
+    errorDetail: null,
     invariantErrors: [],
     phaseHistory: [{ day: 1, phase: "night_wolf" }],
     maxDays: 30,
     actionCount: 0,
     liveAIProcess: null,
     lastAIProcess: null,
-    metrics: { modelCalls: 0, modelSuccesses: 0, modelRetries: 0, fallbacks: 0, streamCalls: 0, streamFallbacks: 0, lastError: "" }
+    metrics: { modelCalls: 0, modelSuccesses: 0, modelRetries: 0, modelFailures: 0, streamCalls: 0, streamFallbacks: 0, lastError: "" }
   };
 }
 
 function startGame(playerName, roleMode, onlineAI, developerMode = appPreferences.developerMode, seedOverride = null) {
-  game = createGame(playerName, roleMode, onlineAI, developerMode, seedOverride);
+  if (!hasOnlineAIConfig()) {
+    updateModelStatus("请先配置线上 AI");
+    settingsDialog.showModal();
+    return false;
+  }
+  const nextGame = createGame(playerName, roleMode, true, developerMode, seedOverride);
+  activeGameRun = gameRuns.begin(nextGame.id);
+  game = nextGame;
+  advancing = false;
   lastInvariantSignature = "";
   pendingHuman = null;
   selectedTarget = null;
+  speakingPlayerId = null;
   lobbyScreen.classList.add("hidden");
   gameScreen.classList.remove("hidden");
   addEvent("night", "系统", "身份已经分配。第一夜开始，所有人闭眼。");
   updateModelStatus();
   render();
-  advanceGame();
+  advanceGame(activeGameRun);
+  return true;
+}
+
+function hasOnlineAIConfig() {
+  return Boolean(modelSettings.baseUrl && modelSettings.model && modelSettings.apiKey);
 }
 
 function updateModelStatus(message) {
   if (message) modelStatus = message;
-  const configured = Boolean(modelSettings.baseUrl && modelSettings.model && modelSettings.apiKey);
+  const configured = hasOnlineAIConfig();
   el("connection-text").textContent = modelStatus;
   if (!game) {
-    el("footer-ai").textContent = configured ? "线上 AI 已配置，开局时需勾选启用" : "AI Bot 兜底模式";
-    return;
-  }
-  if (!game.onlineAI) {
-    el("footer-ai").textContent = "本局：本地 Bot（未启用线上 AI）";
+    el("footer-ai").textContent = configured ? "线上 AI 已配置" : "需要配置线上 AI";
     return;
   }
   if (!configured) {
-    el("footer-ai").textContent = "本局：线上 AI 未配置，使用 Bot";
+    el("footer-ai").textContent = "本局：线上 AI 未配置";
     return;
   }
-  const { modelCalls = 0, modelSuccesses = 0, fallbacks = 0 } = game.metrics || {};
-  el("footer-ai").textContent = `${modelSettings.dialect === "anthropic" ? "Anthropic" : "OpenAI"} 线上 AI · 调用 ${modelCalls} · 成功 ${modelSuccesses} · 回退 ${fallbacks}`;
+  const { modelCalls = 0, modelSuccesses = 0, modelFailures = 0 } = game.metrics || {};
+  el("footer-ai").textContent = `${modelSettings.dialect === "anthropic" ? "Anthropic" : "OpenAI"} 线上 AI · 调用 ${modelCalls} · 成功 ${modelSuccesses} · 失败 ${modelFailures}`;
 }
 
 function checkWinner() {
@@ -334,36 +415,47 @@ function finishIfNeeded() {
   return true;
 }
 
-function delay(ms = 260) {
-  if (simulationMode) return Promise.resolve();
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function delay(ms = 260, run = activeGameRun) {
+  const wait = simulationMode || window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ? Promise.resolve()
+    : new Promise((resolve) => setTimeout(resolve, ms));
+  return wait.then(() => {
+    if (run) gameRuns.assertCurrent(run);
+  });
 }
 
-async function advanceGame() {
-  if (!game || advancing || pendingHuman || game.phase === "ended") return;
+async function advanceGame(run = activeGameRun) {
+  const runGame = game;
+  if (!runGame || !gameRuns.isCurrent(run) || advancing || pendingHuman || runGame.phase === "ended") return;
   advancing = true;
   try {
-    while (game && !pendingHuman && game.phase !== "ended") {
+    while (gameRuns.isCurrent(run) && game === runGame && !pendingHuman && runGame.phase !== "ended") {
       render();
-      if (game.phase === "night_wolf") await handleWolfNight();
-      else if (game.phase === "night_witch") await handleWitchNight();
-      else if (game.phase === "night_seer") await handleSeerNight();
-      else if (game.phase === "night_resolve") await resolveNight();
-      else if (game.phase === "dawn") await handleDawn();
-      else if (game.phase === "discussion") await handleDiscussion();
-      else if (game.phase === "vote_duel") await handleDuelSpeech();
-      else if (game.phase === "last_words") await handleLastWords();
-      else if (game.phase === "vote" || game.phase === "vote_retry") await handleVote();
+      if (runGame.phase === "night_wolf") await handleWolfNight();
+      else if (runGame.phase === "night_witch") await handleWitchNight();
+      else if (runGame.phase === "night_seer") await handleSeerNight();
+      else if (runGame.phase === "night_resolve") await resolveNight();
+      else if (runGame.phase === "dawn") await handleDawn();
+      else if (runGame.phase === "discussion") await handleDiscussion();
+      else if (runGame.phase === "vote_duel") await handleDuelSpeech();
+      else if (runGame.phase === "last_words") await handleLastWords();
+      else if (runGame.phase === "vote" || runGame.phase === "vote_retry") await handleVote();
       else break;
     }
   } catch (error) {
+    if (isStaleGameRunError(error) || !gameRuns.isCurrent(run) || game !== runGame) return;
     const message = `状态机异常：${String(error?.message || error).slice(0, 180)}`;
+    recordErrorLog({ source: "state-machine", error });
+    game.error = "本局发生错误，对局已暂停。";
+    game.errorDetail = message;
+    game.liveAIProcess = null;
     game.invariantErrors = [...new Set([...(game.invariantErrors || []), message])];
     console.error("Game state machine error:", error);
   } finally {
-    advancing = false;
-    render();
+    if (gameRuns.isCurrent(run) && game === runGame) {
+      advancing = false;
+      render();
+    }
   }
 }
 
@@ -526,9 +618,8 @@ async function handleDiscussion() {
     explodeWolf(player.id);
     return;
   }
-  registerPublicClaim(decision.claim);
   const speechEvent = addEvent("speech", seatLabel(player.id), decision.speech);
-  registerSpeechClaims(player.id, decision.speech, speechEvent.id);
+  registerSpeechClaims(player.id, decision.speech, speechEvent.id, decision.speechActs);
   recordSpeechMetadata(player, decision.speech, decision, speechEvent.id);
   speakingPlayerId = null;
   game.discussionIndex += 1;
@@ -551,9 +642,8 @@ async function handleDuelSpeech() {
   speakingPlayerId = player.id;
   render();
   const decision = await getAIDecision(player, "speech", [], { canExplode: false, duel: true });
-  registerPublicClaim(decision.claim);
   const speechEvent = addEvent("speech", seatLabel(player.id), decision.speech);
-  registerSpeechClaims(player.id, decision.speech, speechEvent.id);
+  registerSpeechClaims(player.id, decision.speech, speechEvent.id, decision.speechActs);
   recordSpeechMetadata(player, decision.speech, decision, speechEvent.id);
   speakingPlayerId = null;
   game.duelIndex += 1;
@@ -578,9 +668,8 @@ async function handleLastWords() {
   speakingPlayerId = player.id;
   render();
   const decision = await getAIDecision(player, "speech", [], { canExplode: false, lastWords: true });
-  registerPublicClaim(decision.claim);
   const speechEvent = addEvent("speech", seatLabel(player.id), decision.speech);
-  registerSpeechClaims(player.id, decision.speech, speechEvent.id);
+  registerSpeechClaims(player.id, decision.speech, speechEvent.id, decision.speechActs);
   recordSpeechMetadata(player, decision.speech, decision, speechEvent.id);
   speakingPlayerId = null;
   completeLastWords();
@@ -700,8 +789,16 @@ function submitHuman(action) {
   }
   else if (pending.kind === "seer") applySeerCheck(pending.playerId, action.targetId);
   else if (pending.kind === "witch") {
-    if (action.action === "save" && !game.witch.saveAvailable) return;
-    if (action.action === "poison" && (!game.witch.poisonAvailable || !legalTarget(action.targetId, pending.candidates))) return;
+    const resourceCheck = validateWitchActionResources(action.action, {
+      saveAvailable: game.witch.saveAvailable,
+      poisonAvailable: game.witch.poisonAvailable,
+      killTargetId: pending.killTargetId
+    });
+    if (!resourceCheck.ok) {
+      updateModelStatus(resourceCheck.reason);
+      return;
+    }
+    if (action.action === "poison" && !legalTarget(action.targetId, pending.candidates)) return;
     game.night.witchAction = action;
     recordWitchNightMemory(pending.playerId);
   } else if (pending.kind === "speech" && action.action === "explode") {
@@ -711,7 +808,6 @@ function submitHuman(action) {
     const speech = normalizeHumanSpeech(action.speech);
     if (!speech) return;
     const speaker = playerById(pending.playerId);
-    if (speaker?.role === "seer") registerPublicClaim(seerClaim(speaker));
     const speechEvent = addEvent("speech", seatLabel(pending.playerId), speech);
     registerSpeechClaims(pending.playerId, speech, speechEvent.id);
     recordSpeechMetadata(speaker, speech, {}, speechEvent.id);
@@ -720,7 +816,6 @@ function submitHuman(action) {
     const speech = normalizeHumanSpeech(action.speech);
     if (!speech) return;
     const speaker = playerById(pending.playerId);
-    if (speaker?.role === "seer") registerPublicClaim(seerClaim(speaker));
     const speechEvent = addEvent("speech", seatLabel(pending.playerId), speech);
     registerSpeechClaims(pending.playerId, speech, speechEvent.id);
     recordSpeechMetadata(speaker, speech, {}, speechEvent.id);
@@ -729,7 +824,6 @@ function submitHuman(action) {
     const speech = normalizeHumanSpeech(action.speech);
     if (!speech) return;
     const speaker = playerById(pending.playerId);
-    if (speaker?.role === "seer") registerPublicClaim(seerClaim(speaker));
     const speechEvent = addEvent("speech", seatLabel(pending.playerId), speech);
     registerSpeechClaims(pending.playerId, speech, speechEvent.id);
     recordSpeechMetadata(speaker, speech, {}, speechEvent.id);
@@ -756,7 +850,7 @@ function privateContext(player) {
   const context = buildAgentContext({
     gameId: game.id,
     day: game.day,
-    phase: game.phase,
+    phase: visiblePhaseForPlayer(game.phase, player.role),
     self: {
       id: player.id,
       seat: player.seat + 1,
@@ -791,9 +885,14 @@ function privateContext(player) {
     promptVersion: "v1-context-boundary"
   });
   const lines = [`你的座位是${seatLabel(player.id)}。你的身份是${ROLES[player.role].name}，阵营是${ROLES[player.role].faction === "werewolf" ? "狼人" : "好人"}。`];
+  const aliveSeatSet = new Set(context.game.aliveSeats);
+  const deadSeats = game.players.map((item) => item.seat + 1).filter((seat) => !aliveSeatSet.has(seat));
+  lines.push(`当前存活座位：${context.game.aliveSeats.map((seat) => `${seat}号`).join("、") || "无"}。已出局座位：${deadSeats.map((seat) => `${seat}号`).join("、") || "无"}；不得要求已出局玩家继续回应、解释或参与投票。`);
   lines.push(memoryPrompt(memory, seatLabel));
   const privateEvents = context.self.privateEvents.slice(-6).map((event) => event.text);
   if (privateEvents.length) lines.push(`你最近的私密事实：${privateEvents.join("；")}`);
+  const voteHistory = context.game.voteHistory.map((event) => event.text).filter(Boolean);
+  if (voteHistory.length) lines.push(`历史完整票型：${voteHistory.join("；")}`);
   if (context.wolfRoom) {
     lines.push(`你的狼人队友：${context.wolfRoom.teammates.join("、")}。`);
     if (context.wolfRoom.messages.length) lines.push(`狼队私聊：${context.wolfRoom.messages.map((message) => `${message.speaker}：${message.text}`).join("\n")}`);
@@ -817,56 +916,82 @@ function seerClaim(player) {
   return { playerId: player.id, role: "seer", checks, day: game.day };
 }
 
-function formatSeerClaim(claim) {
-  const checks = claim?.checks || [];
-  const result = checks.map(({ targetId, faction }) => {
-    const target = playerById(targetId);
-    return `${seatLabel(target.id)}是${faction === "werewolf" ? "狼人" : "好人"}`;
-  }).join("，");
-  return `我是预言家${result ? `，${result}` : "，昨夜暂未获得有效查验"}。`;
+function speechActContext(player) {
+  const witchAction = game.night.witchAction || null;
+  const witchTargetId = witchAction?.action === "poison" ? witchAction.targetId : game.night.wolfTarget;
+  return {
+    speakerRole: player.role,
+    speakerSeat: player.seat + 1,
+    seerChecks: Object.entries(game.seerKnowledge[player.id] || {}).map(([targetId, result]) => ({
+      targetSeat: playerById(targetId)?.seat + 1,
+      result
+    })),
+    witchAction: witchAction?.action || null,
+    witchTargetSeat: playerById(witchTargetId)?.seat + 1 || null
+  };
 }
 
-function registerPublicClaim(claim) {
-  if (!claim || claim.role !== "seer" || !playerById(claim.playerId)) return;
-  game.publicClaims = game.publicClaims.filter((item) => item.playerId !== claim.playerId);
-  game.publicClaims.push(claim);
-  const speaker = playerById(claim.playerId);
-  const sourceEventId = game.nextEventId;
-  const nodes = [addClaimNode(game.claimGraph, {
-    day: game.day,
-    speakerId: speaker.id,
-    speakerSeat: speaker.seat + 1,
-    type: CLAIM_TYPES.ROLE_CLAIM,
-    targetId: speaker.id,
-    targetSeat: speaker.seat + 1,
-    claimedValue: "seer",
-    sourceEventId
-  })];
-  for (const check of claim.checks || []) {
-    const target = playerById(check.targetId);
-    if (!target) continue;
-    nodes.push(addClaimNode(game.claimGraph, {
-      day: game.day,
-      speakerId: speaker.id,
-      speakerSeat: speaker.seat + 1,
-      type: CLAIM_TYPES.SEER_RESULT_CLAIM,
-      targetId: target.id,
+function prepareSpeechActs(player, decision) {
+  let acts = normalizeSpeechActs(decision.speechActs);
+  const bluffPlan = player.role === "werewolf" ? wolfBluffPlan(player) : null;
+  if (bluffPlan) {
+    const target = playerById(bluffPlan.targetId);
+    acts = acts.filter((act) => ![
+      SPEECH_ACT_TYPES.ROLE_CLAIM,
+      SPEECH_ACT_TYPES.SEER_RESULT
+    ].includes(act.type));
+    acts.push({ type: SPEECH_ACT_TYPES.ROLE_CLAIM, role: "seer" });
+    if (target) acts.push({
+      type: SPEECH_ACT_TYPES.SEER_RESULT,
       targetSeat: target.seat + 1,
-      claimedValue: check.faction,
-      sourceEventId
-    }));
+      result: bluffPlan.faction
+    });
   }
-  for (const memory of Object.values(game.agentMemories)) {
-    if (!memory || !playerById(memory.playerId)?.alive) continue;
-    for (const node of nodes.filter(Boolean)) addClaimToMemory(memory, node);
-  }
+  const validation = validateSpeechActs(acts, speechActContext(player));
+  return {
+    acts: validation.ok ? validation.acceptedActs : [],
+    warnings: validation.errors,
+    rejectedActs: validation.rejectedActs,
+    bluffPlan
+  };
 }
 
-function registerSpeechClaims(speakerId, speech, sourceEventId) {
+function registerSpeechClaims(speakerId, speech, sourceEventId, speechActs = null) {
   const speaker = playerById(speakerId);
   if (!speaker || !speech) return;
   const nodes = [];
-  const claimsSeer = isSeerClaimText(speech);
+  const hasStructuredActs = Array.isArray(speechActs);
+  const normalizedActs = hasStructuredActs ? normalizeSpeechActs(speechActs) : [];
+  const factualActs = hasStructuredActs ? claimsFromSpeechActs(normalizedActs) : [];
+  const claimsSeer = hasStructuredActs
+    ? factualActs.some((act) => act.type === SPEECH_ACT_TYPES.ROLE_CLAIM && act.role === "seer")
+    : isSeerClaimText(speech);
+  const parsedSeerClaim = hasStructuredActs ? null : extractPublicSeerClaim(speech, {
+      speakerId,
+      speakerSeat: speaker.seat + 1,
+      day: game.day
+    });
+  const parsedChecks = hasStructuredActs
+    ? factualActs.filter((act) => act.type === SPEECH_ACT_TYPES.SEER_RESULT).map((act) => {
+      const target = game.players.find((player) => player.seat + 1 === act.targetSeat);
+      return target ? { targetId: target.id, targetSeat: target.seat + 1, faction: act.result } : null;
+    }).filter(Boolean)
+    : (parsedSeerClaim?.checks || []).map((check) => {
+      const target = game.players.find((player) => player.seat + 1 === check.targetSeat);
+      return target ? { targetId: target.id, targetSeat: target.seat + 1, faction: check.faction } : null;
+    }).filter(Boolean);
+  if (claimsSeer || parsedSeerClaim) {
+    const previousClaim = game.publicClaims.find((item) => item.playerId === speakerId && item.role === "seer");
+    const checksByTarget = new Map((previousClaim?.checks || []).map((check) => [check.targetId, check.faction]));
+    parsedChecks.forEach((check) => checksByTarget.set(check.targetId, check.faction));
+    game.publicClaims = game.publicClaims.filter((item) => item.playerId !== speakerId);
+    game.publicClaims.push({
+      playerId: speakerId,
+      role: "seer",
+      checks: [...checksByTarget].map(([targetId, faction]) => ({ targetId, faction })),
+      day: game.day
+    });
+  }
   if (claimsSeer) {
     nodes.push(addClaimNode(game.claimGraph, {
       day: game.day,
@@ -878,21 +1003,53 @@ function registerSpeechClaims(speakerId, speech, sourceEventId) {
       claimedValue: "seer",
       sourceEventId
     }));
+    for (const check of parsedChecks) {
+      nodes.push(addClaimNode(game.claimGraph, {
+        day: game.day,
+        speakerId,
+        speakerSeat: speaker.seat + 1,
+        type: CLAIM_TYPES.SEER_RESULT_CLAIM,
+        targetId: check.targetId,
+        targetSeat: check.targetSeat,
+        claimedValue: check.faction,
+        sourceEventId
+      }));
+    }
   }
-  const resultPattern = /([1-6])\s*号(?:是|为)?\s*(查杀|狼人|金水|好人)/g;
-  for (const match of speech.matchAll(resultPattern)) {
-    const target = game.players.find((player) => player.seat + 1 === Number(match[1]));
-    if (!target) continue;
-    nodes.push(addClaimNode(game.claimGraph, {
-      day: game.day,
-      speakerId,
-      speakerSeat: speaker.seat + 1,
-      type: claimsSeer ? CLAIM_TYPES.SEER_RESULT_CLAIM : CLAIM_TYPES.IDENTITY_HYPOTHESIS,
-      targetId: target.id,
-      targetSeat: target.seat + 1,
-      claimedValue: ["查杀", "狼人"].includes(match[2]) ? "werewolf" : "village",
-      sourceEventId
-    }));
+  if (hasStructuredActs) {
+    for (const act of normalizedActs.filter((item) => item.type === SPEECH_ACT_TYPES.SUSPICION)) {
+      const target = game.players.find((player) => player.seat + 1 === act.targetSeat);
+      if (!target) continue;
+      nodes.push(addClaimNode(game.claimGraph, {
+        day: game.day,
+        speakerId,
+        speakerSeat: speaker.seat + 1,
+        type: CLAIM_TYPES.IDENTITY_HYPOTHESIS,
+        targetId: target.id,
+        targetSeat: target.seat + 1,
+        claimedValue: act.result,
+        sourceEventId
+      }));
+    }
+  } else {
+    const parsedCheckKeys = new Set(parsedChecks.map((check) => `${check.targetId}:${check.faction}`));
+    const resultPattern = /([1-6])\s*号(?:是|为)?\s*(查杀|狼人|金水|好人)/g;
+    for (const match of speech.matchAll(resultPattern)) {
+      const target = game.players.find((player) => player.seat + 1 === Number(match[1]));
+      if (!target) continue;
+      const claimedValue = ["查杀", "狼人"].includes(match[2]) ? "werewolf" : "village";
+      if (claimsSeer && parsedCheckKeys.has(`${target.id}:${claimedValue}`)) continue;
+      nodes.push(addClaimNode(game.claimGraph, {
+        day: game.day,
+        speakerId,
+        speakerSeat: speaker.seat + 1,
+        type: claimsSeer ? CLAIM_TYPES.SEER_RESULT_CLAIM : CLAIM_TYPES.IDENTITY_HYPOTHESIS,
+        targetId: target.id,
+        targetSeat: target.seat + 1,
+        claimedValue,
+        sourceEventId
+      }));
+    }
   }
   for (const memory of Object.values(game.agentMemories)) {
     if (!memory || !playerById(memory.playerId)?.alive) continue;
@@ -905,11 +1062,7 @@ function isSeerClaimText(text) {
 }
 
 function wolfHasPublicSeerClaim() {
-  return game.events.some((event) => {
-    if (event.kind !== "speech") return false;
-    const speaker = game.players.find((player) => event.actor === seatLabel(player.id));
-    return speaker?.role === "werewolf" && isSeerClaimText(event.text);
-  });
+  return game.publicClaims.some((claim) => claim.role === "seer" && playerById(claim.playerId)?.role === "werewolf");
 }
 
 function wolfBluffPlan(player) {
@@ -982,7 +1135,10 @@ function refreshInvariantState() {
   const errors = validateGameState(game);
   game.invariantErrors = errors;
   const signature = errors.join("|");
-  if (signature && signature !== lastInvariantSignature) console.error("Game invariant violation:", errors);
+  if (signature && signature !== lastInvariantSignature) {
+    console.error("Game invariant violation:", errors);
+    errors.forEach((error) => recordErrorLog({ source: "invariant", error }));
+  }
   lastInvariantSignature = signature;
 }
 
@@ -1007,6 +1163,14 @@ function defaultCommunicationIntent(player, speech, action) {
   return "inform";
 }
 
+function decisionClaimsRole(decision, role, speech = decision?.speech) {
+  if (Array.isArray(decision?.speechActs)) {
+    return normalizeSpeechActs(decision.speechActs)
+      .some((act) => act.type === SPEECH_ACT_TYPES.ROLE_CLAIM && act.role === role);
+  }
+  return role === "seer" ? isSeerClaimText(speech) : role === "witch" ? isExplicitWitchClaim(speech) : false;
+}
+
 function normalizeSpeechMetadata(player, decision, extra = {}) {
   const speech = String(decision.speech || "").trim();
   const action = decision.action;
@@ -1022,15 +1186,19 @@ function normalizeSpeechMetadata(player, decision, extra = {}) {
         : game.publicClaims.length > 1
           ? "medium"
           : "low";
+  const claimsSeer = decisionClaimsRole(decision, "seer", speech);
   const disclosurePlan = planDisclosure({
     role: player.role,
     pressureLevel,
     hasUnreportedSeerResults: player.role === "seer" && Boolean(seerClaim(player)?.checks?.length),
-    claimsSeer: isSeerClaimText(speech)
+    claimsSeer
   });
-  const disclosureMode = DISCLOSURE_MODES.includes(decision.disclosureMode)
-    ? decision.disclosureMode
+  const fallbackDisclosureMode = player.role === "seer" && !claimsSeer
+    ? "withhold"
     : disclosurePlan.mode;
+  const disclosureMode = isDisclosureModeAllowed(player.role, decision.disclosureMode)
+    ? decision.disclosureMode
+    : fallbackDisclosureMode;
   const targetIds = (Array.isArray(decision.targetSeats) ? decision.targetSeats : [])
     .map(seatIdFromSpeechValue)
     .filter((id, index, list) => id && list.indexOf(id) === index)
@@ -1051,7 +1219,7 @@ function recordSpeechMetadata(player, speech, decision, sourceEventId) {
     role: player.role,
     pressureLevel: meta.pressureLevel,
     hasUnreportedSeerResults: player.role === "seer" && Boolean(seerClaim(player)?.checks?.length),
-    claimsSeer: isSeerClaimText(speech),
+    claimsSeer: decisionClaimsRole(decision, "seer", speech),
     forced: meta.disclosureMode
   });
   recordCommunication(memory, {
@@ -1064,7 +1232,7 @@ function recordSpeechMetadata(player, speech, decision, sourceEventId) {
     expectedReaction: meta.expectedReaction,
     text: speech
   });
-  if (player.role === "werewolf" && (meta.disclosureMode === "bluff" || isSeerClaimText(speech))) {
+  if (player.role === "werewolf" && (meta.disclosureMode === "bluff" || decisionClaimsRole(decision, "seer", speech))) {
     recordDeception(memory, {
       type: "BLUFF",
       day: game.day,
@@ -1088,7 +1256,8 @@ function recordSpeechMetadata(player, speech, decision, sourceEventId) {
 }
 
 function promptFor(player, kind, candidates, extra = {}) {
-  const labels = candidates.map((id) => id === ABSTAIN ? `${ABSTAIN}=弃票` : `${id}=${seatLabel(id)}`).join("、");
+  const legalTargetIds = candidates.join("、");
+  const targetSeatMap = candidates.map((id) => id === ABSTAIN ? `${ABSTAIN}表示弃票` : `${id}对应${seatLabel(id)}`).join("、");
   const publicClaims = publicSeerClaims();
   const publicClaimText = publicClaims.length
     ? publicClaims.map((claim) => `${seatLabel(claim.playerId)}自称预言家：${(claim.checks || []).map((check) => `${seatLabel(check.targetId)}${check.faction === "werewolf" ? "查杀" : "好人结果"}`).join("、") || "暂无查验"}`).join("；")
@@ -1097,26 +1266,26 @@ function promptFor(player, kind, candidates, extra = {}) {
   const publicPriority = player.role !== "werewolf" && publicClaims.length === 1 && publicWolfTargets.length
     ? `当前只有一条公开预言家声明给出${publicWolfTargets.map(seatLabel).join("、")}查杀。首夜查验完全正常，声明即使来自已出局玩家也仍是公开证据，但不是身份翻牌；没有第二名预言家或硬性矛盾时，好人应优先核对查杀，强行保查杀或转攻预言家的人提高怀疑。`
     : "";
-  const evidenceBoundary = "公开事实边界：系统的普通放逐和昨夜出局只确认座位与出局，不确认身份，也不确认狼刀、毒药或解药来源；玩家说“我是女巫/预言家”以及预言家报告的查验都只是公开声明，除非系统明确写出“公开确认”，不能升级为真实身份。请把内容分成公开事实、你的推断、待验证假设，不能使用“已知、坐实、证明、感谢女巫”等无依据结论。";
-  const common = `当前是第${game.day}天，阶段：${game.phase}。你的座位：${seatLabel(player.id)}。\n${evidenceBoundary}\n公开预言家信息：${publicClaimText}\n局势优先级：${publicPriority || "结合公开发言、票型和死亡信息独立判断。"}\n公开记录：\n${publicHistory() || "暂无"}\n合法目标：${labels || "无"}`;
-  const audit = `reasoningSummary 只写1到2句可公开审计的决策依据，不要输出隐藏思维过程。`;
-  if (kind === "speech") {
-    const seerInstruction = player.role === "seer" ? `你必须公开跳预言家并准确报告全部查验：${formatSeerClaim(seerClaim(player))}` : "";
-    const wolfBluff = player.role === "werewolf" ? wolfBluffPlan(player) : null;
-    const wolfBluffInstruction = wolfBluff
-      ? `狼队本轮已分配你悍跳预言家任务。必须公开说“我是预言家”，并报告${seatLabel(wolfBluff.targetId)}是${wolfBluff.result}；这是对外欺骗，不是私密真相。核心目的：${wolfBluff.reason}。`
+  const evidenceBoundary = "公开事实边界：系统的普通放逐和昨夜出局只确认座位与出局，不确认身份，也不确认狼刀、毒药或解药来源。玩家公开的身份、查验、刀口和用药内容都是该玩家的声明，不会自动升级为系统真值；无角色授权的信息只能使用“怀疑、可能、推测、待验证”等措辞。";
+  const common = `当前是第${game.day}天，阶段：${visiblePhaseForPlayer(game.phase, player.role)}。你的座位：${seatLabel(player.id)}。\n${evidenceBoundary}\n公开预言家信息：${publicClaimText}\n局势优先级：${publicPriority || "结合公开发言、票型和死亡信息独立判断。"}\n公开记录：\n${publicHistory() || "暂无"}\n合法targetId（返回时只能原样填写其中一个ID，不要附加座位或说明）：${legalTargetIds || "无"}\n目标座位映射（仅供理解，不能作为targetId返回）：${targetSeatMap || "无"}`;
+  const wolfBluff = kind === "speech" && player.role === "werewolf" ? wolfBluffPlan(player) : null;
+  const wolfBluffInstruction = wolfBluff
+    ? `狼队本轮已分配你悍跳预言家任务。必须公开说“我是预言家”，并报告${seatLabel(wolfBluff.targetId)}是${wolfBluff.result}；这是对外欺骗，不是私密真相。核心目的：${wolfBluff.reason}。`
+    : "";
+  const phaseInstruction = kind === "speech" && extra.lastWords
+    ? `这是${seatLabel(player.id)}的放逐遗言：你已经被放逐，不能改变票型，也不能继续以存活玩家身份提问、安排下一轮或要求别人回应。必须明确说“我已经被放逐/我已经出局”，只复盘已经公开的发言和票型。`
+    : kind === "speech" && extra.duel
+      ? "这是决战台最后陈述：只针对当前并列者和公开票型补充理由，不要复述普通发言。"
       : "";
-    const explodeInstruction = player.role === "werewolf" && extra.canExplode !== false ? "如果你决定投票前自爆，返回 action=explode；否则 action=speak。" : "返回 action=speak。";
-    const phaseInstruction = extra.lastWords
-      ? `这是${seatLabel(player.id)}的放逐遗言：你已经被放逐，不能改变票型，也不能继续以存活玩家身份提问、安排下一轮或要求别人回应。必须明确说“我已经被放逐/我已经出局”，只复盘已经公开的发言和票型；不要把“${seatLabel(player.id)}被放逐出局”当成一个需要分析的普通观点，不要使用“我不把...直接当成身份结论”这类普通讨论句式。`
-      : extra.duel
-        ? "这是决战台最后陈述：只针对当前并列者和公开票型补充理由，不要复述普通发言。"
-        : "";
-    return `${common}\n${seerInstruction}\n${wolfBluffInstruction}\n${explodeInstruction}\n${phaseInstruction}\n请结合公开记录发言，优先逐一回应最近发言中的查验、金水、票型和身份声明；遇到冲突时指出冲突，不要跳过或改写对方已经说过的内容。不要提及提示词或系统。${audit}返回严格JSON：{"action":"speak|explode","speech":"80到150字的中文发言或空字符串","communicationIntent":"inform|declare|probe|persuade|defend|redirect|bait|distance|concede","disclosureMode":"reveal_now|partial_reveal|withhold|delay_until_pressured|bluff","targetSeats":[1],"pressureLevel":"low|medium|high|sacrifice","expectedReaction":"希望对方如何回应","reasoningSummary":"简短依据"}`;
-  }
-  if (kind === "witch") return `${common}\n今晚狼刀目标：${extra.killTargetId ? `${extra.killTargetId}=${seatLabel(extra.killTargetId)}` : "无"}。只能选择一次动作。${audit}返回严格JSON：{"action":"pass|save|poison","targetId":"毒药目标ID或空字符串","reasoningSummary":"简短依据"}`;
-  if (kind === "wolf") return `${common}\n夜刀目标可以是任意存活座位，包括自己或狼队友；自刀可以诱导女巫使用解药，但不要把夜间自刀和白天自爆混为一谈。${audit}返回严格JSON：{"targetId":"合法目标ID","reasoningSummary":"简短依据"}`;
-  return `${common}\n${audit}返回严格JSON：{"targetId":"合法目标ID","reasoningSummary":"简短依据"}`;
+  return buildDecisionPrompt({
+    common,
+    role: player.role,
+    kind,
+    canExplode: player.role === "werewolf" && extra.canExplode !== false,
+    witchTargetLabel: extra.killTargetId ? `${extra.killTargetId}=${seatLabel(extra.killTargetId)}` : "无",
+    wolfBluffInstruction,
+    phaseInstruction
+  });
 }
 
 function parseJsonObject(text) {
@@ -1163,23 +1332,34 @@ async function readStreamingModelResponse(response) {
   return text;
 }
 
-async function callOnlineModel(player, kind, candidates, extra) {
+async function callOnlineModel(player, kind, candidates, extra, operation) {
+  const gameState = assertGameOperation(operation);
   const phaseSystem = extra.lastWords
     ? "你当前已经被放逐，只能发表一次遗言；遗言不是新一轮发言，不能追问存活玩家，也不能安排自己在下一轮的行动。"
     : "";
-  const system = `你是六人狼人杀中的独立AI玩家。规则：2狼、2平民、预言家、女巫；屠边时狼人胜，狼人全灭时好人胜。只可使用提供给你的信息，不得假设其他玩家真实身份。普通放逐和夜间出局不翻牌，系统也不公布死因；玩家自称的身份和预言家查验属于声明，不是真值。你必须严格区分公开事实、身份声明、推断和待验证假设：没有系统确认时，不能说某人“已知是女巫/平民”，不能说某人“被女巫毒死/被狼人刀死”，也不能用“感谢女巫”替代证据。${phaseSystem}\n${privateContext(player)}\n你的人格风格：${player.persona}。`;
-  const requestId = `${game.id}:${game.day}:${player.id}:${kind}:${game.aiTraces.length + 1}`;
+  const system = `你是六人狼人杀中的独立AI玩家。规则：2狼、2平民、预言家、女巫；屠边时狼人胜，狼人全灭时好人胜。只可使用提供给你的信息，不得假设其他玩家真实身份。普通放逐和夜间出局不翻牌，系统也不公布死因；玩家公开的身份、查验、刀口和用药内容都只是该玩家的声明，不会自动成为系统真值。你必须严格区分系统公开事实、角色授权的私人事实、其他玩家声明和待验证推断；没有角色授权时，死因只能使用“我怀疑、可能、大概率、推测、待验证”等措辞。${phaseSystem}\n${privateContext(player)}\n你的人格风格：${player.persona}。`;
+  const requestId = `${gameState.id}:${gameState.day}:${player.id}:${kind}:${gameState.aiTraces.length + 1}`;
+  const speechRetryGuidance = player.role === "witch"
+    ? "如要公开刀口或用药，必须明确以“我是女巫”开头并只陈述自己的真实夜间记录；其他死因仍需标记为推测。"
+    : player.role === "seer"
+      ? "可以隐藏或部分公开；如报告查验，必须明确声明自己是预言家，并且只报告真实查验。"
+      : "死因可以作为大胆假设，但必须使用“我怀疑/可能/大概率/推测/待验证”等标记，并说明要结合票型验证。";
   const run = async (attempt, previousError = "") => {
     const retryHint = previousError
-      ? `\n上一次输出未通过校验（${previousError.slice(0, 120)}）。这次只返回满足要求的严格 JSON，不要解释格式。`
+      ? `\n上一次输出未通过校验（${previousError.slice(0, 120)}）。这次不要输出推理过程或 reasoning_content，只返回满足要求的最终 JSON，不要解释格式。${kind === "speech" ? speechRetryGuidance : ""}`
       : "";
     const streaming = kind === "speech" && modelSettings.streaming !== false;
-    const effort = modelSettings.reasoningEffort;
-    const maxTokens = kind === "speech"
-      ? ({ high: 1600, medium: 1200 }[effort] || 1000)
-      : ({ high: 900, medium: 700 }[effort] || 600);
-    game.metrics.modelCalls += 1;
-    if (streaming) game.metrics.streamCalls += 1;
+    const configuredEffort = modelSettings.reasoningEffort;
+    const baseMaxTokens = kind === "speech"
+      ? ({ high: 2200, medium: 1700 }[configuredEffort] || 1400)
+      : ({ high: 1400, medium: 1100 }[configuredEffort] || 900);
+    const effort = attempt > 0 ? "" : modelSettings.reasoningEffort;
+    const maxTokens = attempt > 0
+      ? (kind === "speech" ? 2600 : 1800)
+      : baseMaxTokens;
+    assertGameOperation(operation);
+    gameState.metrics.modelCalls += 1;
+    if (streaming) gameState.metrics.streamCalls += 1;
     const requestBody = JSON.stringify({
       requestId,
       retryAttempt: attempt,
@@ -1199,20 +1379,25 @@ async function callOnlineModel(player, kind, candidates, extra) {
     let response = await fetch(useStream ? "/api/model-stream" : "/api/model", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: requestBody
+      body: requestBody,
+      signal: operation.run.signal
     });
+    assertGameOperation(operation);
     if (useStream && (response.status === 404 || response.status === 405)) {
-      game.metrics.streamFallbacks += 1;
+      gameState.metrics.streamFallbacks += 1;
       useStream = false;
       response = await fetch("/api/model", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: requestBody
+        body: requestBody,
+        signal: operation.run.signal
       });
+      assertGameOperation(operation);
     }
     const payload = useStream
       ? { text: await readStreamingModelResponse(response) }
       : await response.json();
+    assertGameOperation(operation);
     if (!payload.text) throw new Error(payload.error || "模型未返回内容");
     const modelMeta = { reasoningTokens: Number(payload.reasoningTokens || 0) };
     const parsed = parseJsonObject(payload.text);
@@ -1223,24 +1408,32 @@ async function callOnlineModel(player, kind, candidates, extra) {
       if (player.role !== "werewolf" || extra.canExplode === false) throw new Error("当前阶段不能自爆");
       return { action: "explode", reasoningSummary: summary, modelMeta };
     }
+    if (kind === "speech" && parsed.action !== "speak") throw new Error("公开发言 action 必须是 speak 或当前允许的 explode");
+    if (kind === "speech" && parsed.disclosureMode && !isDisclosureModeAllowed(player.role, parsed.disclosureMode)) {
+      throw new Error(`${ROLES[player.role].name}不能使用披露模式 ${parsed.disclosureMode}`);
+    }
     if (kind === "speech" && typeof parsed.speech === "string" && parsed.speech.trim()) {
       let speech = parsed.speech.trim();
       const bluffPlan = player.role === "werewolf" ? wolfBluffPlan(player) : null;
-      const bluffResultPattern = bluffPlan
-        ? new RegExp(`${seatLabel(bluffPlan.targetId)}[^。！？\\n]{0,8}${bluffPlan.result}`)
-        : null;
-      if (bluffPlan && (!isSeerClaimText(speech) || !bluffResultPattern.test(speech))) {
-        throw new Error(`狼队悍跳任务要求报告${seatLabel(bluffPlan.targetId)}是${bluffPlan.result}`);
+      const bluffTarget = bluffPlan ? playerById(bluffPlan.targetId) : null;
+      const bluffMatches = bluffPlan && bluffTarget
+        ? matchesWolfBluffReport(speech, { targetSeat: bluffTarget.seat + 1, result: bluffPlan.result })
+        : false;
+      if (bluffPlan && bluffTarget && (!isSeerClaimText(speech) || !bluffMatches)) {
+        const canonicalBluff = `我是预言家，昨晚查验${bluffTarget.seat + 1}号，${bluffTarget.seat + 1}号是${bluffPlan.result}。`;
+        speech = `${canonicalBluff}${speech}`.slice(0, 180);
       }
-      const claim = seerClaim(player);
-      if (claim && !speech.includes("预言家")) speech = `${formatSeerClaim(claim)}${speech}`;
-      const speechCheck = validateAIPublicSpeech(speech, player, extra);
-      if (!speechCheck.ok) throw new Error(speechCheck.reason);
+      const speechCheck = validateAIPublicSpeechEnvelope(speech);
+      if (!speechCheck.ok) {
+        const error = new Error(speechCheck.reason);
+        error.diagnostic = `模型发言：${speech.slice(0, 260)}`;
+        throw error;
+      }
       speech = speechCheck.text;
       return {
         speech,
+        speechActs: parsed.speechActs,
         reasoningSummary: summary,
-        claim,
         communicationIntent: parsed.communicationIntent,
         disclosureMode: parsed.disclosureMode,
         targetSeats: parsed.targetSeats,
@@ -1249,10 +1442,22 @@ async function callOnlineModel(player, kind, candidates, extra) {
         modelMeta
       };
     }
+    if (kind === "speech") throw new Error("模型公开发言为空");
     if (kind === "witch") {
       if (["pass", "save", "poison"].includes(parsed.action)) {
-        if (parsed.action === "poison" && !legalTarget(parsed.targetId, candidates)) throw new Error("模型选择了非法毒药目标");
-        return { action: parsed.action, targetId: parsed.targetId || null, reasoningSummary: summary, modelMeta };
+        const resourceCheck = validateWitchActionResources(parsed.action, {
+          saveAvailable: game.witch.saveAvailable,
+          poisonAvailable: game.witch.poisonAvailable,
+          killTargetId: extra.killTargetId
+        });
+        if (!resourceCheck.ok) throw new Error(resourceCheck.reason);
+        const targetId = normalizeModelTarget(parsed.targetId, candidates, game.players, ABSTAIN);
+        if (parsed.action === "poison" && !legalTarget(targetId, candidates)) {
+          const error = new Error("模型选择了非法毒药目标");
+          error.diagnostic = targetDiagnostic(parsed.targetId, candidates, game.players, ABSTAIN);
+          throw error;
+        }
+        return { action: parsed.action, targetId: parsed.action === "poison" ? targetId : null, reasoningSummary: summary, modelMeta };
       }
     }
     const priorityTarget = kind === "vote" ? priorityPublicWolfVote(player, candidates) : null;
@@ -1264,15 +1469,21 @@ async function callOnlineModel(player, kind, candidates, extra) {
         modelOverride: parsed.targetId !== priorityTarget ? "公开查杀优先级覆盖模型原始票型" : null
       };
     }
-    if (legalTarget(parsed.targetId, candidates)) return { targetId: parsed.targetId, reasoningSummary: summary, modelMeta };
-    throw new Error("模型选择了非法目标");
+    const targetId = normalizeModelTarget(parsed.targetId, candidates, game.players, ABSTAIN);
+    if (legalTarget(targetId, candidates)) return { targetId, reasoningSummary: summary, modelMeta };
+    const error = new Error("模型选择了非法目标");
+    error.diagnostic = targetDiagnostic(parsed.targetId, candidates, game.players, ABSTAIN);
+    throw error;
   };
   try {
     return await run(0);
   } catch (error) {
-    game.metrics.lastError = error?.message || "模型请求失败";
+    if (isStaleGameRunError(error)) throw error;
+    assertGameOperation(operation);
+    gameState.metrics.lastError = error?.message || "模型请求失败";
     await delay(360);
-    game.metrics.modelRetries += 1;
+    assertGameOperation(operation);
+    gameState.metrics.modelRetries += 1;
     return run(1, error?.message || "格式校验失败");
   }
 }
@@ -1296,114 +1507,6 @@ function claimedGoodTargets(candidates) {
 function priorityPublicWolfVote(player, candidates) {
   if (player.role === "werewolf" || publicSeerClaims().length !== 1) return null;
   return claimedWolfTargets(candidates)[0] || null;
-}
-
-function botDecision(player, kind, candidates, extra = {}) {
-  const pick = (list) => list[Math.floor(game.random() * list.length)];
-  if (kind === "speech") {
-    if (extra.lastWords) {
-      const claim = seerClaim(player);
-      const lastWords = generateLastWordsSpeech({
-        selfSeat: player.seat + 1,
-        role: player.role,
-        seerClaim: claim
-          ? { ...claim, checks: claim.checks.map((check) => ({ ...check, targetSeat: playerById(check.targetId)?.seat + 1 })) }
-          : null
-      });
-      return { ...lastWords, claim };
-    }
-    const bluffPlan = wolfBluffPlan(player);
-    if (player.role === "werewolf" && bluffPlan) {
-      return {
-        speech: `我是${player.seat + 1}号预言家，昨晚查验了${seatLabel(bluffPlan.targetId)}，结果是${bluffPlan.result}。${bluffPlan.faction === "village" ? `这和${seatLabel(bluffPlan.targetId)}被另一名预言家查杀的说法冲突，大家先比较两边的验人逻辑。` : `我建议今天优先处理${seatLabel(bluffPlan.targetId)}，不要被单一预言家带票。`}`,
-        reasoningSummary: bluffPlan.reason,
-        communicationIntent: "declare",
-        disclosureMode: "bluff",
-        targetSeats: [bluffPlan.targetId]
-      };
-    }
-    if (player.role === "seer") {
-      const claim = seerClaim(player);
-      const wolves = claim.checks.filter((check) => check.faction === "werewolf");
-      const plan = wolves.length ? `今天优先放逐 ${playerById(wolves[0].targetId).seat + 1} 号。` : "目前都是好人结果，请未验玩家重点表水。";
-      return {
-        speech: `${formatSeerClaim(claim)}${plan}`,
-        reasoningSummary: "六人屠边局容错低，预言家应尽早公开身份和验人，让好人形成可执行的票型。",
-        claim
-      };
-    }
-    return generateContextualBotSpeech({
-      role: player.role,
-      selfSeat: player.seat + 1,
-      persona: player.persona,
-      day: game.day,
-      turn: game.discussionIndex,
-      aliveSeats: alivePlayers().map((item) => item.seat + 1),
-      recentEvents: game.events.slice(-16).map((event) => ({
-        kind: event.kind,
-        day: event.day,
-        actor: event.actor,
-        speakerSeat: game.players.find((item) => event.actor === seatLabel(item.id))?.seat + 1 || null,
-        text: event.text
-      })),
-      publicClaims: publicSeerClaims().map((claim) => ({
-        speakerSeat: (playerById(claim.playerId)?.seat || 0) + 1,
-        checks: (claim.checks || []).map((check) => ({
-          targetSeat: (playerById(check.targetId)?.seat || 0) + 1,
-          faction: check.faction
-        }))
-      })),
-      previousSpeeches: game.events.filter((event) => event.kind === "speech").map((event) => event.text)
-    });
-  }
-  if (kind === "witch") {
-    if (game.witch.saveAvailable && extra.killTargetId && (extra.killTargetId === player.id || game.day === 1) && game.random() > 0.28) {
-      return { action: "save", reasoningSummary: extra.killTargetId === player.id ? "狼刀命中自己，使用解药可以保住关键神职。" : "第一夜信息不足，优先用解药保住存活轮次和白天信息量。" };
-    }
-    const publicWolves = claimedWolfTargets(candidates);
-    if (game.witch.poisonAvailable && publicWolves.length) return { action: "poison", targetId: publicWolves[0], reasoningSummary: "公开预言家给出查杀，毒掉查杀目标可在夜间快速压缩狼坑。" };
-    if (game.witch.poisonAvailable && game.day > 1 && candidates.length && game.random() > 0.72) return { action: "poison", targetId: pick(candidates), reasoningSummary: "对局进入后期且毒药尚未使用，主动出药避免神职死亡后浪费资源。" };
-    return { action: "pass", reasoningSummary: "当前没有足够可靠的毒人依据，保留药水等待更明确的信息。" };
-  }
-  if (kind === "wolf") {
-    const claimedSeers = publicSeerClaims().map((claim) => claim.playerId).filter((id) => candidates.includes(id));
-    if (claimedSeers.length) return { targetId: claimedSeers[0], reasoningSummary: "公开跳出的预言家能持续产生查验，优先击杀可阻断好人的信息来源。" };
-    const teammateProposal = game.wolfRoom.proposals.slice().reverse().find((proposal) => proposal.day === game.day && proposal.proposerId !== player.id && candidates.includes(proposal.targetId));
-    if (teammateProposal) return { targetId: teammateProposal.targetId, reasoningSummary: `参考${seatLabel(teammateProposal.proposerId)}的提案，狼队统一刀口以减少分歧。` };
-    if (game.witch.saveAvailable && game.day === 1 && game.random() > 0.72 && candidates.includes(player.id)) {
-      return { targetId: player.id, reasoningSummary: "第一夜女巫解药仍可用，选择自刀尝试诱导女巫救人，消耗好人的关键资源。" };
-    }
-    return { targetId: pick(candidates), reasoningSummary: "从所有非狼队友中选择刀口；当前没有更高优先级的公开神职目标。" };
-  }
-  if (kind === "seer") return { targetId: pick(candidates), reasoningSummary: "优先查验尚未验证的存活玩家，扩大下一轮可公开的信息覆盖。" };
-  if (kind === "vote" && candidates.includes(ABSTAIN)) {
-    const validTargets = candidates.filter((id) => id !== ABSTAIN);
-    if (!validTargets.length) return { targetId: ABSTAIN, reasoningSummary: "当前没有合法放逐目标，只能弃票。" };
-    if (player.role === "seer") {
-      const checkedWolf = Object.entries(game.seerKnowledge[player.id] || {}).find(([id, faction]) => faction === "werewolf" && validTargets.includes(id));
-      if (checkedWolf) return { targetId: checkedWolf[0], reasoningSummary: "该玩家是自己的查杀结果，优先投出能直接推进好人胜利。" };
-    }
-    if (player.role !== "werewolf") {
-      const publicWolves = claimedWolfTargets(validTargets);
-      if (publicWolves.length) return { targetId: publicWolves[0], reasoningSummary: "桌面存在公开查杀，先投查杀并用翻牌结果验证预言家信息。" };
-      const protectedTargets = new Set([...claimedGoodTargets(validTargets), ...publicSeerClaims().map((claim) => claim.playerId)]);
-      const unresolvedTargets = validTargets.filter((id) => !protectedTargets.has(id));
-      if (unresolvedTargets.length) {
-        return { targetId: pick(unresolvedTargets), reasoningSummary: "当前没有公开查杀，先避开预言家及其金水，从尚未验证的位置中投票。" };
-      }
-    } else {
-      const seerTargets = publicSeerClaims().map((claim) => claim.playerId).filter((id) => validTargets.includes(id));
-      if (seerTargets.length) return { targetId: seerTargets[0], reasoningSummary: "投票压制公开预言家，减少狼队友被查杀和组织归票的风险。" };
-    }
-    if (game.random() < 0.06) return { targetId: ABSTAIN, reasoningSummary: "当前没有形成可靠信息链，选择弃票避免把随机票变成错误放逐。" };
-    candidates = validTargets;
-  }
-  let pool = [...candidates];
-  if (player.role === "werewolf") {
-    const nonWolves = pool.filter((id) => playerById(id).role !== "werewolf");
-    if (nonWolves.length) pool = nonWolves;
-  }
-  return { targetId: pick(pool), reasoningSummary: "没有强查验或明确公开信息，依据当前合法目标做低置信度选择。" };
 }
 
 function describeDecision(kind, decision) {
@@ -1438,6 +1541,8 @@ function recordAITrace(player, kind, decision, source) {
     pressureLevel: decision.pressureLevel || null,
     targetIds: decision.targetIds || [],
     expectedReaction: decision.expectedReaction || null,
+    speechActs: normalizeSpeechActs(decision.speechActs),
+    speechAuditWarnings: Array.isArray(decision.speechAuditWarnings) ? decision.speechAuditWarnings.slice(0, 6) : [],
     modelOverride: decision.modelOverride || null,
     situationAudit: decision.situationAudit || null,
     strategyPlan: serializeStrategyPlan(decision.strategyPlan)
@@ -1454,23 +1559,13 @@ function renderAIProcess() {
   const process = game?.liveAIProcess || game?.lastAIProcess;
   if (!process) return "";
   const live = Boolean(game.liveAIProcess);
-  const source = process.source || (game.onlineAI ? "线上模型" : "本地 Bot");
+  const source = process.source || "线上模型";
   const stage = process.stage || (live ? "正在生成结构化决策" : "已完成");
   const summary = process.summary
     ? `<p class="ai-process-summary"><strong>公开依据：</strong>${escapeHtml(process.summary)}</p>`
     : "";
   const tokenNote = process.reasoningTokens ? ` · 推理 ${process.reasoningTokens} tokens` : "";
   return `<section class="ai-process${live ? " is-live" : ""}"><div class="ai-process-head"><strong>${escapeHtml(source)}</strong><span>${escapeHtml(aiProcessKind(process.kind))}${tokenNote}</span></div><div class="ai-process-stage">${escapeHtml(stage)}</div>${summary}<small>仅展示结构化决策依据，不展示隐藏思维链或私密身份信息。</small></section>`;
-}
-
-function repairRepeatedSpeech(player, decision, extra = {}) {
-  if (!decision?.speech || player.role === "seer") return decision;
-  const fingerprint = speechFingerprint(decision.speech);
-  const repeated = game.events.some((event) => event.kind === "speech" && speechFingerprint(event.text) === fingerprint);
-  if (!repeated) return decision;
-  const replacement = botDecision(player, "speech", [], extra);
-  const repaired = prepareAIDecision(player, "speech", replacement, extra, []);
-  return { ...repaired, repeatedSpeechRepaired: true };
 }
 
 function validateSpeechContext(speech, player, extra = {}) {
@@ -1488,27 +1583,53 @@ function validateSpeechContext(speech, player, extra = {}) {
   return { ok: true, text };
 }
 
+function validateAIPublicSpeechEnvelope(speech) {
+  const raw = String(speech || "").trim();
+  if (!raw) return { ok: false, reason: "公开发言不能为空" };
+  if (raw.length > 180) return { ok: false, reason: "公开发言不能超过180字" };
+  return { ok: true, text: sanitizePublicSpeech(raw, game.players) };
+}
+
 function validateAIPublicSpeech(speech, player, extra = {}) {
-  const syntaxCheck = validatePublicSpeech(speech, game.players);
+  const syntaxCheck = validateAIPublicSpeechEnvelope(speech);
   if (!syntaxCheck.ok) return syntaxCheck;
+  const warnings = [];
   if (player.role === "seer") {
     const claim = seerClaim(player);
     const seerCheck = validateSeerSpeech(syntaxCheck.text, {
       speakerSeat: player.seat + 1,
+      requireAll: false,
       checks: (claim?.checks || []).map((check) => ({
         targetSeat: playerById(check.targetId)?.seat + 1,
         faction: check.faction
       }))
     });
-    if (!seerCheck.ok) return seerCheck;
+    if (!seerCheck.ok) warnings.push(seerCheck.reason);
+  }
+  if (player.role === "witch") {
+    const poisonTarget = playerById(game.night.witchAction?.targetId);
+    const witchCheck = validateWitchSpeech(syntaxCheck.text, {
+      killTargetSeat: playerById(game.night.wolfTarget)?.seat + 1 || null,
+      action: game.night.witchAction?.action || null,
+      poisonTargetSeat: poisonTarget ? poisonTarget.seat + 1 : null
+    });
+    if (!witchCheck.ok) warnings.push(witchCheck.reason);
   }
   const evidenceCheck = validatePublicSpeechEvidence(syntaxCheck.text, {
     speakerSeat: player.seat + 1,
+    speakerRole: player.role,
     publicEvents: game.events,
     allowDeception: player.role === "werewolf"
   });
-  if (!evidenceCheck.ok) return evidenceCheck;
-  return validateSpeechContext(evidenceCheck.text, player, extra);
+  if (!evidenceCheck.ok) warnings.push(evidenceCheck.reason);
+  const semanticText = evidenceCheck.ok ? evidenceCheck.text : syntaxCheck.text;
+  const targetCheck = validateSpeechTargets(semanticText, {
+    aliveSeats: alivePlayers().map((item) => item.seat + 1)
+  });
+  if (!targetCheck.ok) warnings.push(targetCheck.reason);
+  const contextCheck = validateSpeechContext(targetCheck.ok ? targetCheck.text : semanticText, player, extra);
+  if (!contextCheck.ok) warnings.push(contextCheck.reason);
+  return { ok: true, text: syntaxCheck.text, warnings };
 }
 
 function prepareAIDecision(player, kind, decision, extra, candidates = []) {
@@ -1542,69 +1663,92 @@ function prepareAIDecision(player, kind, decision, extra, candidates = []) {
   };
   if (kind !== "speech") return { ...decision, strategyPlan, situationAudit };
   if (decision.action === "explode") return { ...decision, strategyPlan, situationAudit, ...normalizeSpeechMetadata(player, decision, extra) };
+  const speechActPlan = prepareSpeechActs(player, decision);
   const speechCheck = validateAIPublicSpeech(decision.speech, player, extra);
-  const sourceSpeech = speechCheck.ok ? speechCheck.text : "我只根据公开发言和票型判断，请各位明确站边。";
-  const generated = generateSpeechFromPlan(strategyPlan, sourceSpeech, {
-    validateSpeech: (text) => validateAIPublicSpeech(text, player, extra)
+  const roleClaims = new Set(speechActPlan.acts
+    .filter((act) => act.type === SPEECH_ACT_TYPES.ROLE_CLAIM)
+    .map((act) => act.role));
+  const missingStructuredRoleClaim = (isSeerClaimText(decision.speech) && !roleClaims.has("seer"))
+    || (isExplicitWitchClaim(decision.speech) && !roleClaims.has("witch"));
+  const delivery = resolveSpeechDelivery({
+    hardError: speechCheck.ok ? null : speechCheck.reason,
+    structuredErrors: speechActPlan.warnings,
+    missingStructuredRoleClaim,
+    semanticWarnings: speechCheck.warnings || [],
+    acceptedActs: speechActPlan.acts
   });
-  return { ...decision, speech: generated.speech, strategyPlan, situationAudit, ...normalizeSpeechMetadata(player, { ...decision, speech: generated.speech }, extra) };
+  const shouldUseFallback = delivery.reject || delivery.useFallback;
+  const sourceSpeech = shouldUseFallback
+    ? "我只根据公开发言和票型判断，请各位明确站边。"
+    : speechCheck.text;
+  const generated = generateSpeechFromPlan(strategyPlan, sourceSpeech, {
+    validateSpeech: validateAIPublicSpeechEnvelope
+  });
+  const speechActs = shouldUseFallback ? [] : speechActPlan.acts;
+  const speechAuditWarnings = [
+    ...speechActPlan.warnings,
+    ...(speechCheck.warnings || []),
+    ...(missingStructuredRoleClaim ? ["正文包含身份声明，但模型没有提供对应的结构化发言动作"] : [])
+  ];
+  return {
+    ...decision,
+    speech: generated.speech,
+    speechActs,
+    speechAuditWarnings,
+    strategyPlan,
+    situationAudit,
+    ...normalizeSpeechMetadata(player, { ...decision, speech: generated.speech, speechActs }, extra)
+  };
 }
 
 async function getAIDecision(player, kind, candidates, extra = {}) {
-  game.debugProgress = `${kind}:begin:${player.id}`;
-  const onlineConfigured = Boolean(game.onlineAI && modelSettings.baseUrl && modelSettings.model && modelSettings.apiKey);
-  game.liveAIProcess = {
+  const operation = captureGameOperation();
+  const gameState = operation.game;
+  gameState.debugProgress = `${kind}:begin:${player.id}`;
+  if (!hasOnlineAIConfig()) throw new Error("线上 AI 配置不完整，请打开模型设置并测试连接");
+  gameState.liveAIProcess = {
     playerId: player.id,
     kind,
-    source: onlineConfigured ? "线上模型" : game.onlineAI ? "本地 Bot（模型未配置）" : "本地 Bot",
+    source: "线上模型",
     stage: "已读取公开发言、票型和死亡信息；正在生成结构化决策",
     summary: ""
   };
   renderActionPanel();
-  if (onlineConfigured) {
-    try {
-      updateModelStatus(`线上 AI · ${seatLabel(player.id)}思考中`);
-      const onlineDecision = await callOnlineModel(player, kind, candidates, extra);
-      const decision = repairRepeatedSpeech(player, prepareAIDecision(player, kind, onlineDecision, extra, candidates), extra);
-      game.metrics.modelSuccesses += 1;
-      game.metrics.lastError = "";
-      game.lastAIProcess = {
-        ...game.liveAIProcess,
-        source: decision.repeatedSpeechRepaired ? "线上模型 + Bot 修复" : "线上模型",
-        stage: "已完成：动作通过规则校验",
-        summary: decision.reasoningSummary,
-        reasoningTokens: decision.modelMeta?.reasoningTokens || 0
-      };
-      game.liveAIProcess = null;
-      recordAITrace(player, kind, decision, "线上模型");
-      updateModelStatus("线上 AI 已连接");
-      return decision;
-    } catch (error) {
-      game.metrics.fallbacks += 1;
-      game.metrics.lastError = error?.message || "模型请求失败";
-      game.liveAIProcess = {
-        ...game.liveAIProcess,
-        source: "Bot 回退",
-        stage: `线上模型失败，正在使用本地 Bot：${error?.message || "未知错误"}`
-      };
-      renderActionPanel();
-      updateModelStatus("线上 AI 失败，已回退 Bot");
-      console.warn("Online AI fallback:", error);
+  try {
+    updateModelStatus(`线上 AI · ${seatLabel(player.id)}思考中`);
+    const onlineDecision = await callOnlineModel(player, kind, candidates, extra, operation);
+    assertGameOperation(operation);
+    const decision = prepareAIDecision(player, kind, onlineDecision, extra, candidates);
+    gameState.metrics.modelSuccesses += 1;
+    gameState.metrics.lastError = "";
+    gameState.lastAIProcess = {
+      ...gameState.liveAIProcess,
+      source: "线上模型",
+      stage: "已完成：动作通过规则校验",
+      summary: decision.reasoningSummary,
+      reasoningTokens: decision.modelMeta?.reasoningTokens || 0
+    };
+    gameState.liveAIProcess = null;
+    recordAITrace(player, kind, decision, "线上模型");
+    updateModelStatus("线上 AI 已连接");
+    return decision;
+  } catch (error) {
+    if (isStaleGameRunError(error) || !gameRuns.isCurrent(operation.run) || game !== gameState) {
+      throw new StaleGameRunError(operation.run.gameId);
     }
+    recordErrorLog({ source: "online-ai", error, playerId: player.id, kind, diagnostic: error?.diagnostic });
+    gameState.metrics.modelFailures += 1;
+    gameState.metrics.lastError = error?.message || "模型请求失败";
+    gameState.lastAIProcess = {
+      ...gameState.liveAIProcess,
+      source: "线上模型",
+      stage: `请求失败，对局已暂停：${error?.message || "未知错误"}`,
+      summary: "未使用本地 Bot 继续对局。"
+    };
+    gameState.liveAIProcess = null;
+    updateModelStatus("线上 AI 失败，对局已暂停");
+    throw error;
   }
-  game.debugProgress = `${kind}:bot:${player.id}`;
-  const decision = repairRepeatedSpeech(player, prepareAIDecision(player, kind, botDecision(player, kind, candidates, extra), extra, candidates), extra);
-  game.lastAIProcess = {
-    ...game.liveAIProcess,
-    source: onlineConfigured ? "Bot 回退" : game.onlineAI ? "本地 Bot（模型未配置）" : "本地 Bot",
-    stage: "已完成：本地决策通过规则校验",
-    summary: decision.reasoningSummary
-  };
-  game.liveAIProcess = null;
-  game.debugProgress = `${kind}:prepared:${player.id}`;
-  recordAITrace(player, kind, decision, game.onlineAI ? (onlineConfigured ? "Bot 回退" : "本地 Bot（模型未配置）") : "本地 Bot");
-  game.debugProgress = `${kind}:traced:${player.id}`;
-  return decision;
 }
 
 function roleDescription(player) {
@@ -1620,11 +1764,16 @@ function roleDescription(player) {
 function renderTable() {
   tableStage.querySelectorAll(".seat").forEach((node) => node.remove());
   const human = humanPlayer();
+  const activeActorVisible = canExposeActiveActor({
+    phase: game.phase,
+    debugMode: game.debugMode,
+    activePlayerId: speakingPlayerId
+  });
   for (const player of game.players) {
     const isWolfTeammate = human.role === "werewolf" && player.role === "werewolf" && player.id !== human.id;
     const node = document.createElement("button");
     node.type = "button";
-    node.className = `seat${player.controller === "human" ? " is-you" : ""}${isWolfTeammate ? " is-teammate" : ""}${player.alive ? "" : " is-dead"}${speakingPlayerId === player.id ? " is-speaking" : ""}${pendingHuman?.candidates?.includes(player.id) ? " seat-selectable" : ""}`;
+    node.className = `seat${player.controller === "human" ? " is-you" : ""}${isWolfTeammate ? " is-teammate" : ""}${player.alive ? "" : " is-dead"}${activeActorVisible && speakingPlayerId === player.id ? " is-speaking" : ""}${pendingHuman?.candidates?.includes(player.id) ? " seat-selectable" : ""}`;
     node.dataset.seat = String(player.seat);
     node.disabled = !pendingHuman?.candidates?.includes(player.id);
     const visibleName = game.debugMode ? player.name : `${player.seat + 1}号座位`;
@@ -1671,6 +1820,22 @@ function renderWolfRoom() {
   return `<section class="wolf-room"><div class="wolf-room-title">狼队私聊</div>${messages}${game.wolfRoom.plan ? `<p class="wolf-plan">${escapeHtml(game.wolfRoom.plan.summary)}</p>` : ""}</section>`;
 }
 
+function renderErrorLogEntry(entry, compact = false) {
+  if (!entry) return '<div class="debug-empty">暂无错误日志。</div>';
+  const player = entry.playerId ? playerById(entry.playerId) : null;
+  const meta = [
+    entry.at ? String(entry.at).replace("T", " ").replace("Z", "") : "未知时间",
+    entry.source || "runtime",
+    player ? seatLabel(player.id) : null,
+    entry.kind,
+    entry.day ? `第${entry.day}天` : null,
+    entry.phase
+  ].filter(Boolean).join(" · ");
+  const diagnostic = entry.diagnostic ? `<div class="debug-error-diagnostic">${escapeHtml(entry.diagnostic)}</div>` : "";
+  const stack = !compact && entry.stack ? `<pre class="debug-error-stack">${escapeHtml(entry.stack)}</pre>` : "";
+  return `<article class="debug-error"><div class="debug-error-meta">${escapeHtml(meta)}</div><div class="debug-error-message">${escapeHtml(entry.message || "未知错误")}</div>${diagnostic}${stack}</article>`;
+}
+
 function renderDeveloperPanel() {
   const toggle = el("toggle-developer");
   toggle.setAttribute("aria-pressed", String(game.debugMode));
@@ -1690,7 +1855,13 @@ function renderDeveloperPanel() {
     const situation = trace.situationAudit
       ? `<div class="trace-social">局势：狼胜距${trace.situationAudit.wolfWinDistance} · 好人胜距${trace.situationAudit.villageWinDistance} · 合法分支${trace.situationAudit.branchCount}</div>`
       : "";
-    return `<article class="debug-trace"><div class="trace-meta"><strong>${player.seat + 1}号 ${escapeHtml(player.name)}</strong>${escapeHtml(ROLES[trace.role].name)} · 第${trace.day}天<br>${escapeHtml(trace.source)}</div><div class="trace-action"><div>${escapeHtml(trace.action)}</div>${strategy}${social}${situation}<div class="trace-reason">依据：${escapeHtml(trace.reasoningSummary)}</div></div></article>`;
+    const speechActs = trace.speechActs?.length
+      ? `<div class="trace-strategy">发言动作：${escapeHtml(trace.speechActs.map((act) => act.type).join("、"))}</div>`
+      : "";
+    const speechWarnings = trace.speechAuditWarnings?.length
+      ? `<div class="trace-reason">软审计：${escapeHtml(trace.speechAuditWarnings.join("；"))}</div>`
+      : "";
+    return `<article class="debug-trace"><div class="trace-meta"><strong>${player.seat + 1}号 ${escapeHtml(player.name)}</strong>${escapeHtml(ROLES[trace.role].name)} · 第${trace.day}天<br>${escapeHtml(trace.source)}</div><div class="trace-action"><div>${escapeHtml(trace.action)}</div>${strategy}${social}${situation}${speechActs}<div class="trace-reason">依据：${escapeHtml(trace.reasoningSummary)}</div>${speechWarnings}</div></article>`;
   }).join("") : '<div class="debug-empty">AI 尚未产生决策记录。</div>';
   const planSummary = game.wolfRoom.plan?.summary;
   const wolfMessages = game.wolfRoom.messages
@@ -1708,8 +1879,10 @@ function renderDeveloperPanel() {
     return `<article class="debug-memory"><div class="debug-memory-head"><strong>${escapeHtml(seatLabel(player.id))}</strong><span>${escapeHtml(ROLES[player.role].name)} · 公开${memory.publicEvents.length} · 私密${privateCount} · 声明${claimCount}</span></div><div class="debug-memory-beliefs">狼坑候选：${beliefs || "暂无"}</div><div class="debug-memory-analysis">二阶${memory.secondOrderBeliefs.length} · 动机${memory.motiveAnalyses.length} · 发言意图${memory.communicationLog.length}</div><div class="debug-memory-reason">最近依据：${escapeHtml(memory.lastReasoningSummary || "暂无")}</div></article>`;
   }).join("");
   el("debug-memories").innerHTML = memoryCards || '<div class="debug-empty">尚未创建 AI 认知快照。</div>';
+  const errorLogs = (game.errorLog || []).slice().reverse();
+  el("debug-errors").innerHTML = errorLogs.length ? errorLogs.map((entry) => renderErrorLogEntry(entry)).join("") : '<div class="debug-empty">暂无错误日志。</div>';
   const metrics = game.metrics || {};
-  const modelAudit = `<div class="debug-invariant">模型调用 ${metrics.modelCalls || 0} · 成功 ${metrics.modelSuccesses || 0} · 重试 ${metrics.modelRetries || 0} · 回退 ${metrics.fallbacks || 0}${metrics.lastError ? ` · 最近错误：${escapeHtml(metrics.lastError)}` : ""}</div>`;
+  const modelAudit = `<div class="debug-invariant">模型调用 ${metrics.modelCalls || 0} · 成功 ${metrics.modelSuccesses || 0} · 重试 ${metrics.modelRetries || 0} · 失败 ${metrics.modelFailures || 0}${metrics.lastError ? ` · 最近错误：${escapeHtml(metrics.lastError)}` : ""}</div>`;
   el("debug-invariants").innerHTML = modelAudit + (game.invariantErrors.length
     ? game.invariantErrors.map((error) => `<div class="debug-invariant error">${escapeHtml(error)}</div>`).join("")
     : `<div class="debug-invariant ok">当前状态满足已注册规则不变量。</div><div class="debug-invariant">运行进度：${escapeHtml(game.debugProgress || "空闲")}</div>`);
@@ -1747,8 +1920,26 @@ function renderActionPanel() {
     el("restart-action").addEventListener("click", returnToLobby);
     return;
   }
+  if (game.error) {
+    const latestError = game.debugMode && game.errorLog?.length
+      ? `<div class="debug-error-inline"><strong>最近错误日志</strong>${renderErrorLogEntry(game.errorLog[game.errorLog.length - 1], true)}</div>`
+      : "";
+    const errorTitle = game.debugMode ? "线上 AI 请求失败" : "本局已暂停";
+    const errorMessage = game.debugMode && game.errorDetail ? game.errorDetail : "线上 AI 暂时无法完成当前行动，请重新开局。";
+    actionContent.innerHTML = `<div class="result-box"><strong>${errorTitle}</strong><p>${escapeHtml(errorMessage)}</p><p>未切换到本地 Bot。</p>${latestError}</div><button type="button" class="quiet-button action-submit" id="open-model-settings">打开模型设置</button><button type="button" class="primary-button action-submit" id="restart-action">重新开局 <span>→</span></button>`;
+    el("open-model-settings").addEventListener("click", () => settingsDialog.showModal());
+    el("restart-action").addEventListener("click", returnToLobby);
+    return;
+  }
   if (!pendingHuman) {
-    const thinking = speakingPlayerId ? `${seatLabel(speakingPlayerId)}正在行动` : "规则引擎正在推进阶段";
+    const thinking = publicWaitingText({
+      phase: game.phase,
+      activePlayerLabel: canExposeActiveActor({
+        phase: game.phase,
+        debugMode: game.debugMode,
+        activePlayerId: speakingPlayerId
+      }) ? seatLabel(speakingPlayerId) : ""
+    });
     actionContent.innerHTML = `<p class="action-kicker">WAITING</p><h3 class="action-title">等待桌面行动</h3><p class="action-help">AI 会依次完成发言、技能或投票。轮到你时，操作会自动出现在这里。</p><div class="ai-thinking">${escapeHtml(thinking)}</div>${renderAIProcess()}`;
     return;
   }
@@ -1812,6 +2003,9 @@ function render() {
 }
 
 function returnToLobby() {
+  gameRuns.cancel();
+  activeGameRun = null;
+  advancing = false;
   simulationMode = false;
   lastInvariantSignature = "";
   game = null;
@@ -1827,7 +2021,7 @@ el("start-form").addEventListener("submit", (event) => {
   event.preventDefault();
   appPreferences.developerMode = el("developer-mode").checked;
   saveStoredObject(APP_PREFERENCES_KEY, appPreferences);
-  startGame(el("player-name").value.trim(), el("role-mode").value, el("online-ai").checked, appPreferences.developerMode, el("game-seed").value.trim() || null);
+  startGame(el("player-name").value.trim(), el("role-mode").value, true, appPreferences.developerMode, el("game-seed").value.trim() || null);
 });
 el("new-game").addEventListener("click", returnToLobby);
 el("export-replay").addEventListener("click", () => {
@@ -1845,6 +2039,7 @@ el("export-replay").addEventListener("click", () => {
     aiTraces: game.aiTraces,
     privateEvents: game.privateEvents,
     publicClaims: game.publicClaims,
+    errorLog: game.errorLog,
     claimGraph: game.claimGraph,
     agentMemories: Object.fromEntries(Object.entries(game.agentMemories).map(([id, memory]) => [id, snapshotMemory(memory)])),
     wolfRoom: game.wolfRoom
@@ -1869,7 +2064,7 @@ function loadReplayDocument(replay) {
   const replayReturnState = game ? { game, pendingHuman, selectedTarget, speakingPlayerId, modelStatus } : null;
   const players = replay.players.map((player) => ({ ...player, alive: Boolean(player.alive) }));
   const memories = replay.agentMemories && typeof replay.agentMemories === "object" ? replay.agentMemories : {};
-  game = {
+  const replayGame = {
     id: String(replay.gameId),
     seed: Number(replay.seed) || 0,
     random: createRng(Number(replay.seed) || 0),
@@ -1900,15 +2095,22 @@ function loadReplayDocument(replay) {
     nextEventId: replay.events.length + 1,
     nextPrivateEventId: 1,
     nextTraceId: replay.aiTraces?.length + 1 || 1,
-    onlineAI: false,
+    nextErrorId: (Array.isArray(replay.errorLog) ? replay.errorLog.length : 0) + 1,
+    errorLog: Array.isArray(replay.errorLog) ? replay.errorLog : [],
+    onlineAI: true,
     debugMode: Boolean(appPreferences.developerMode),
     revealedRoles: players.map((player) => player.id),
     ended: true,
+    error: null,
+    errorDetail: null,
     invariantErrors: [],
     phaseHistory: [{ day: Number(replay.day) || 1, phase: "ended" }],
     maxDays: 30,
     actionCount: 0
   };
+  activeGameRun = gameRuns.begin(replayGame.id);
+  game = replayGame;
+  advancing = false;
   lastInvariantSignature = "";
   pendingHuman = null;
   selectedTarget = null;
@@ -1924,7 +2126,9 @@ function exitReplay() {
   if (!game?.replayMode) return returnToLobby();
   const previous = game.replayReturnState;
   if (!previous) return returnToLobby();
+  activeGameRun = gameRuns.begin(previous.game.id);
   game = previous.game;
+  advancing = false;
   pendingHuman = previous.pendingHuman;
   selectedTarget = previous.selectedTarget;
   speakingPlayerId = previous.speakingPlayerId;
@@ -1959,7 +2163,7 @@ el("run-simulation").addEventListener("click", async () => {
   const status = el("simulation-status");
   const metrics = el("simulation-metrics");
   button.disabled = true;
-  status.textContent = "本地模拟运行中（不调用线上模型）...";
+  status.textContent = "线上 AI 模拟运行中...";
   metrics.textContent = "";
   try {
     const query = new URLSearchParams(window.location.search);
@@ -1972,7 +2176,7 @@ el("run-simulation").addEventListener("click", async () => {
     status.textContent = `完成 ${summary.completed}/${simulationCount} · 失败 ${failureCount}${detail}`;
     const villageWins = summary.winners.village || 0;
     const wolfWins = summary.winners.werewolf || 0;
-    metrics.textContent = `本地模拟 · 线上调用 0 · 好人 ${villageWins} · 狼人 ${wolfWins} · 平均 ${summary.averageDays.toFixed(1)} 天 · AI动作 ${summary.averageAiActions.toFixed(1)}`;
+    metrics.textContent = `线上调用 ${summary.modelCalls} · 好人 ${villageWins} · 狼人 ${wolfWins} · 平均 ${summary.averageDays.toFixed(1)} 天 · AI动作 ${summary.averageAiActions.toFixed(1)}`;
   } catch (error) {
     status.textContent = `模拟失败：${error?.message || "未知错误"}`;
     metrics.textContent = "";
@@ -2093,8 +2297,9 @@ function simulationAction(pending) {
 }
 
 async function simulateGame(seed, role = "random", maxTicks = 12000) {
+  if (!hasOnlineAIConfig()) throw new Error("线上 AI 配置不完整，不能运行模拟");
   simulationMode = true;
-  startGame("测试玩家", role, false, true, seed);
+  startGame("测试玩家", role, true, true, seed);
   let ticks = 0;
   while (game && game.phase !== "ended" && ticks < maxTicks) {
     if (pendingHuman) {
@@ -2116,7 +2321,7 @@ async function simulateGame(seed, role = "random", maxTicks = 12000) {
     streamCalls: game?.metrics?.streamCalls || 0,
     streamFallbacks: game?.metrics?.streamFallbacks || 0,
     modelRetries: game?.metrics?.modelRetries || 0,
-    fallbacks: game?.metrics?.fallbacks || 0,
+    modelFailures: game?.metrics?.modelFailures || 0,
     invariantErrors: [...(game?.invariantErrors || [])]
   };
   if (game && game.phase !== "ended") result.invariantErrors.push(`模拟超过${maxTicks}步仍未结束`);
@@ -2145,7 +2350,7 @@ fillSettingsForm();
 
 window.__werewolfDemo = {
   getState: () => game,
-  start: (role = "random", developerMode = true, seed = null) => startGame("测试玩家", role, false, developerMode, seed),
+  start: (role = "random", developerMode = true, seed = null) => startGame("测试玩家", role, true, developerMode, seed),
   simulate: (seed, role = "random", maxTicks = 12000) => simulateGame(seed, role, maxTicks),
   simulateMany: (count = 100, role = "random", startSeed = 1) => simulateMany(count, role, startSeed),
   pending: () => pendingHuman,

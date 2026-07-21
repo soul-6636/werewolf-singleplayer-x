@@ -51,6 +51,8 @@ test("builds Anthropic-compatible messages request", () => {
 test("normalizes OpenAI and Anthropic text responses", () => {
   assert.equal(extractText({ choices: [{ message: { content: '  {"ok":true}  ' } }] }, "openai"), '{"ok":true}');
   assert.equal(extractText({ choices: [{ message: { content: [{ text: "a" }, { text: "b" }] } }] }, "openai"), "ab");
+  assert.equal(extractText({ choices: [{ message: { content: null }, text: "completion text" }] }, "openai"), "completion text");
+  assert.equal(extractText({ output_text: "response text" }, "openai"), "response text");
   assert.equal(extractText({ choices: [{ message: { content: "", reasoning_content: "hidden reasoning" } }] }, "openai"), "");
   assert.equal(extractText({ content: [{ type: "tool_use", input: {} }, { type: "text", text: " hello " }] }, "anthropic"), "hello");
 });
@@ -66,6 +68,7 @@ test("builds streaming requests without changing provider dialect headers", () =
 
 test("normalizes OpenAI and Anthropic stream events", () => {
   assert.deepEqual(normalizeProviderStreamEvent({ dialect: "openai", data: JSON.stringify({ choices: [{ delta: { content: "片段" } }] }) }), { type: "TEXT_DELTA", text: "片段" });
+  assert.deepEqual(normalizeProviderStreamEvent({ dialect: "openai", data: JSON.stringify({ choices: [{ delta: { content: [{ text: "片段" }] } }] }) }), { type: "TEXT_DELTA", text: "片段" });
   assert.deepEqual(normalizeProviderStreamEvent({ dialect: "openai", data: "[DONE]" }), { type: "TEXT_DONE" });
   assert.deepEqual(normalizeProviderStreamEvent({ dialect: "anthropic", event: "content_block_delta", data: JSON.stringify({ delta: { text: "片段" } }) }), { type: "TEXT_DELTA", text: "片段" });
   assert.deepEqual(normalizeProviderStreamEvent({ dialect: "anthropic", event: "message_stop", data: JSON.stringify({ type: "message_stop" }) }), { type: "TEXT_DONE" });

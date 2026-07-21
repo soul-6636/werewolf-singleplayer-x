@@ -81,6 +81,10 @@ export function normalizeProviderStreamEvent({ dialect = "openai", event = "mess
   if (payload?.error) return { type: "ERROR", code: "PROVIDER_ERROR", message: payload.error.message || "Provider 流式请求失败" };
   const delta = payload?.choices?.[0]?.delta?.content;
   if (typeof delta === "string" && delta) return { type: "TEXT_DELTA", text: delta };
+  if (Array.isArray(delta)) {
+    const text = delta.map((part) => part?.text || "").join("");
+    if (text) return { type: "TEXT_DELTA", text };
+  }
   const usage = payload?.usage;
   if (usage) return { type: "USAGE", inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens };
   if (payload?.choices?.[0]?.finish_reason) return { type: "TEXT_DONE" };
@@ -95,8 +99,11 @@ export function extractText(payload, dialect) {
       .join("")
       .trim();
   }
-  const content = payload?.choices?.[0]?.message?.content;
+  const choice = payload?.choices?.[0];
+  const content = choice?.message?.content;
   if (typeof content === "string") return content.trim();
   if (Array.isArray(content)) return content.map((part) => part?.text || "").join("").trim();
+  if (typeof choice?.text === "string") return choice.text.trim();
+  if (typeof payload?.output_text === "string") return payload.output_text.trim();
   return "";
 }

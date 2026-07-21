@@ -28,7 +28,7 @@
           <div class="lobby-copy">
             <p class="eyebrow">SINGLE PLAYER / 6 SEATS</p>
             <h1>把每一句话，<br /><em>放到天亮以后。</em></h1>
-            <p class="lede">你与五名 AI 坐在同一张桌边。默认使用可复现的规则型 Bot；填入模型配置后，可切换线上 AI 发言与决策。</p>
+            <p class="lede">你与五名线上 AI 坐在同一张桌边。配置模型后，AI 会参与发言、技能和投票决策。</p>
             <div class="rule-strip">
               <span><b>2</b> 狼人</span><span><b>2</b> 平民</span><span><b>1</b> 预言家</span><span><b>1</b> 女巫</span>
             </div>
@@ -48,11 +48,7 @@
             </select>
             <label class="field-label" for="game-seed">复现种子 <small>可选</small></label>
             <input id="game-seed" name="gameSeed" type="number" min="1" max="2147483646" inputmode="numeric" placeholder="留空则随机生成" />
-            <label class="toggle-row" for="online-ai">
-              <span><strong>启用线上 AI</strong><small>未配置时自动回退到 Bot</small></span>
-              <input id="online-ai" type="checkbox" />
-              <span class="toggle-ui" aria-hidden="true"></span>
-            </label>
+            <p class="fine-print">开始前需要在右上角配置并测试线上 AI。模型请求失败时，对局会暂停，不会切换到本地 Bot。</p>
             <label class="toggle-row" for="developer-mode">
               <span><strong>开发者模式</strong><small>公开身份与 AI 决策依据</small></span>
               <input id="developer-mode" type="checkbox" />
@@ -67,7 +63,7 @@
           <div class="game-heading">
             <div>
               <p class="eyebrow" id="phase-eyebrow">NIGHT 01</p>
-              <h1 id="phase-title">狼人行动</h1>
+              <h1 id="phase-title">夜间行动</h1>
             </div>
             <div class="game-heading-meta">
               <div class="metric"><span>存活</span><strong id="alive-count">6/6</strong></div>
@@ -116,7 +112,7 @@
           <section class="developer-panel panel hidden" id="developer-panel" aria-label="开发者信息">
             <div class="panel-header developer-header">
               <div><span class="section-label">DEVELOPER VIEW</span><h2>身份与决策审计</h2></div>
-              <div class="developer-tools"><button class="quiet-button" id="run-simulation" type="button">运行 100 局模拟</button><span class="simulation-status" id="simulation-status"></span><span class="simulation-metrics" id="simulation-metrics"></span><span class="developer-warning">仅供调试，不属于玩家可见信息</span></div>
+              <div class="developer-tools"><button class="quiet-button" id="run-simulation" type="button">运行 100 局线上模拟</button><span class="simulation-status" id="simulation-status"></span><span class="simulation-metrics" id="simulation-metrics"></span><span class="developer-warning">仅供调试，不属于玩家可见信息</span></div>
             </div>
             <div class="developer-grid">
               <div>
@@ -136,6 +132,10 @@
               <h3 class="developer-subtitle">AI 独立认知快照（开发审计）</h3>
               <div class="debug-memories" id="debug-memories"></div>
             </div>
+            <div class="debug-error-wrap">
+              <h3 class="developer-subtitle">错误日志</h3>
+              <div class="debug-errors" id="debug-errors"></div>
+            </div>
             <div class="debug-invariant-wrap">
               <h3 class="developer-subtitle">规则不变量</h3>
               <div class="debug-invariants" id="debug-invariants"></div>
@@ -144,13 +144,13 @@
         </section>
       </main>
 
-      <footer class="footer"><span>规则引擎本地运行</span><span>·</span><span id="footer-ai">AI Bot 兜底模式</span></footer>
+      <footer class="footer"><span>规则引擎本地运行</span><span>·</span><span id="footer-ai">需要配置线上 AI</span></footer>
     </div>
 
     <dialog class="settings-dialog" id="settings-dialog">
       <form method="dialog" class="settings-card" id="settings-form">
         <div class="dialog-header"><div><p class="eyebrow">MODEL BRIDGE</p><h2>线上模型设置</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="关闭设置">×</button></div>
-        <p class="dialog-note">配置和 API Key 会以明文保存在当前浏览器本地，仅适合本机 Demo。未配置或调用失败时，AI 会使用本地 Bot 继续对局。</p>
+        <p class="dialog-note">配置和 API Key 会以明文保存在当前浏览器本地，仅适合本机 Demo。本局只使用线上 AI；未配置或调用失败时，对局会暂停。</p>
         <label class="field-label" for="api-dialect">协议</label>
         <select id="api-dialect">
           <option value="openai">OpenAI-compatible / Chat Completions</option>
